@@ -1,0 +1,59 @@
+import os
+import numpy as np
+import pickle
+import time
+
+def get_cache_path(cache_dir="cache"):
+    """创建缓存目录并返回路径"""
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+def cache_exists(dataset_name, cache_dir="cache"):
+    """检查指定数据集的缓存是否存在"""
+    cache_path = os.path.join(get_cache_path(cache_dir), f"{dataset_name}.pkl")
+    return os.path.exists(cache_path)
+
+def save_to_cache(data_dict, dataset_name, cache_dir="cache"):
+    """
+    将数据保存到缓存
+    
+    参数:
+        data_dict: 包含数据的字典
+        dataset_name: 缓存文件名前缀 (不含扩展名)
+        cache_dir: 缓存目录
+    """
+    start_time = time.time()
+    print(f"正在缓存{dataset_name}数据...", end="")
+    
+    cache_path = os.path.join(get_cache_path(cache_dir), f"{dataset_name}.pkl")
+    
+    with open(cache_path, 'wb') as f:
+        pickle.dump(data_dict, f)
+    
+    print(f" 完成! 用时: {time.time() - start_time:.2f}秒")
+    print(f"缓存保存在: {os.path.abspath(cache_path)}")
+
+def load_from_cache(dataset_name, cache_dir="cache"):
+    """
+    从缓存加载数据
+    
+    参数:
+        dataset_name: 缓存文件名前缀 (不含扩展名)
+        cache_dir: 缓存目录
+        
+    返回:
+        缓存的数据字典
+    """
+    start_time = time.time()
+    print(f"从缓存加载{dataset_name}数据...", end="")
+    
+    cache_path = os.path.join(get_cache_path(cache_dir), f"{dataset_name}.pkl")
+    
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(f"缓存文件不存在: {cache_path}")
+    
+    with open(cache_path, 'rb') as f:
+        data = pickle.load(f)
+    
+    print(f" 完成! 用时: {time.time() - start_time:.2f}秒")
+    return data
