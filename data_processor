@@ -111,8 +111,6 @@ class DataProcessor:
         result = {
             "freq_id": [],
             "load_id": [],
-            "condition_id": [],
-            "original": {"frequency_hz": [], "load_kn": []}
         }
         
         for i in range(len(conditions)):
@@ -123,23 +121,14 @@ class DataProcessor:
             freq_id = self.freq_mapping.get(freq, 0)
             load_id = self.load_mapping.get(load, 0)
             
-            # 计算工况ID (0-8)
-            condition_id = freq_id * 3 + (load_id + 1) % 3
-            
             # 添加到结果
             result["freq_id"].append(freq_id)
             result["load_id"].append(load_id)
-            result["condition_id"].append(condition_id)
-            result["original"]["frequency_hz"].append(freq)
-            result["original"]["load_kn"].append(load)
-        
+
         # 转换为numpy数组
         result["freq_id"] = np.array(result["freq_id"])
         result["load_id"] = np.array(result["load_id"])
-        result["condition_id"] = np.array(result["condition_id"])
-        result["original"]["frequency_hz"] = np.array(result["original"]["frequency_hz"])
-        result["original"]["load_kn"] = np.array(result["original"]["load_kn"])
-        
+
         return result
     
     def apply_stft(self, signal_data, component_name=None, **kwargs):
@@ -269,11 +258,6 @@ class DataProcessor:
         subset_conditions = {
             "freq_id": conditions_data["freq_id"][indices],
             "load_id": conditions_data["load_id"][indices],
-            "condition_id": conditions_data["condition_id"][indices],
-            "original": {
-                "frequency_hz": conditions_data["original"]["frequency_hz"][indices],
-                "load_kn": conditions_data["original"]["load_kn"][indices]
-            }
         }
         
         subset_labels = np.array(labels_data)[indices]
@@ -337,168 +321,14 @@ class MultiComponentDataset(Dataset):
         # 获取工况数据
         freq_id = torch.LongTensor([self.conditions['freq_id'][idx]])
         load_id = torch.LongTensor([self.conditions['load_id'][idx]])
-        condition_id = torch.LongTensor([self.conditions['condition_id'][idx]])
         
         # 获取标签
         if self.labels is not None:
             label = torch.LongTensor([self.labels[idx]])
-            return component_tensors, freq_id, load_id, condition_id, label
+            return component_tensors, freq_id, load_id, label
         
-        return component_tensors, freq_id, load_id, condition_id
+        return component_tensors, freq_id, load_id, label
 
-
-class MultiComponentModel(nn.Module):
-    """
-    多部件故障诊断模型
-    针对不同部件的数据使用独立的网络分支进行特征提取
-    """
-    
-    def __init__(self, model_type, num_classes, component_channels, working_condition=True, pretrained=True):
-        """
-        初始化多部件模型
-        
-        参数:
-            model_type: 模型类型，'googlenet', 'resnet18', 'resnet50', 'efficientnet'等
-            num_classes: 故障类型数量
-            component_channels: 列表，包含每个部件的通道数
-            working_condition: 是否包含工况信息
-            pretrained: 是否使用预训练权重
-        """
-        super().__init__()
-        self.model_type = model_type
-        self.working_condition = working_condition
-        self.num_components = len(component_channels)
-        self.component_branches = nn.ModuleList()
-        
-        # 特征维度，根据模型类型设置
-        if model_type == 'googlenet':
-            feature_dim = 1024
-        elif model_type in ['resnet18', 'resnet34']:
-            feature_dim = 512
-        elif model_type in ['resnet50', 'resnet101']:
-            feature_dim = 2048
-        elif 'efficientnet' in model_type:
-            feature_dim = 1280  # 对于efficientnet-b0，其他可能不同
-        else:
-            feature_dim = 512  # 默认值
-        
-        # 为每个部件创建一个分支网络
-        for i, num_channels in enumerate(component_channels):
-            branch = self._create_branch(model_type, num_channels, pretrained)
-            self.component_branches.append(branch)
-        
-        # 工况嵌入
-        if working_condition:
-            self.freq_embedding = nn.Embedding(3, 32)  # 3种频率
-            self.load_embedding = nn.Embedding(3, 32)  # 3种负载
-            
-            # 融合层 (特征+工况)
-            self.fusion = nn.Sequential(
-                nn.Linear(feature_dim * self.num_components + 64, 512),
-                nn.BatchNorm1d(512),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(512, 256),
-                nn.BatchNorm1d(256),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(256, num_classes)
-            )
-        else:
-            # 只有特征的融合层
-            self.fusion = nn.Sequential(
-                nn.Linear(feature_dim * self.num_components, 512),
-                nn.BatchNorm1d(512),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(512, 256),
-                nn.BatchNorm1d(256),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(256, num_classes)
-            )
-    
-    def _create_branch(self, model_type, num_channels, pretrained):
-        """创建一个分支网络"""
-        import torchvision.models as models
-        
-        if model_type == 'googlenet':
-            model = models.googlenet(pretrained=pretrained)
-            # 修改第一层卷积以接受对应通道数
-            if num_channels != 3:
-                original_conv = model.conv1.conv
-                model.conv1.conv = nn.Conv2d(
-                    num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
-                )
-                # 初始化新层权重
-                if pretrained:
-                    with torch.no_grad():
-                        new_weight = torch.mean(original_conv.weight, dim=1, keepdim=True)
-                        model.conv1.conv.weight.copy_(new_weight.repeat(1, num_channels, 1, 1))
-                        
-            # 移除最后的分类层，只用作特征提取器
-            return nn.Sequential(*list(model.children())[:-1])
-            
-        elif model_type.startswith('resnet'):
-            # 选择合适的ResNet版本
-            if model_type == 'resnet18':
-                model = models.resnet18(pretrained=pretrained)
-            elif model_type == 'resnet34':
-                model = models.resnet34(pretrained=pretrained)
-            elif model_type == 'resnet50':
-                model = models.resnet50(pretrained=pretrained)
-            else:
-                model = models.resnet101(pretrained=pretrained)
-                
-            # 修改第一层以接受对应通道数
-            if num_channels != 3:
-                original_conv = model.conv1
-                model.conv1 = nn.Conv2d(
-                    num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
-                )
-                # 初始化新层权重
-                if pretrained:
-                    with torch.no_grad():
-                        new_weight = torch.mean(original_conv.weight, dim=1, keepdim=True)
-                        model.conv1.weight.copy_(new_weight.repeat(1, num_channels, 1, 1))
-                        
-            # 移除最后的分类层，只用作特征提取器
-            return nn.Sequential(*list(model.children())[:-1])
-            
-        elif model_type.startswith('efficientnet'):
-            if model_type == 'efficientnet-b0':
-                model = models.efficientnet_b0(pretrained=pretrained)
-            elif model_type == 'efficientnet-b1':
-                model = models.efficientnet_b1(pretrained=pretrained)
-            else:
-                model = models.efficientnet_b2(pretrained=pretrained)
-                
-            # 修改第一层以接受对应通道数
-            if num_channels != 3:
-                original_conv = model.features[0][0]
-                model.features[0][0] = nn.Conv2d(
-                    num_channels, original_conv.out_channels,
-                    kernel_size=original_conv.kernel_size,
-                    stride=original_conv.stride,
-                    padding=original_conv.padding,
-                    bias=False
-                )
-                # 初始化新层权重
-                if pretrained:
-                    with torch.no_grad():
-                        new_weight = torch.mean(original_conv.weight, dim=1, keepdim=True)
-                        model.features[0][0].weight.copy_(new_weight.repeat(1, num_channels, 1, 1))
-            
-            # 移除最后的分类层，只用作特征提取器
-            return nn.Sequential(
-                model.features,
-                model.avgpool,
-                nn.Flatten()
-            )
-            
-        else:
-            raise ValueError(f"不支持的模型类型: {model_type}")
-    
     def forward(self, x_list, freq_id=None, load_id=None):
         """
         前向传播
