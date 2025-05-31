@@ -1,0 +1,262 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import random
+
+class SpecAugment:
+    """SpecAugment实现，用于STFT频谱图数据增强"""
+    
+    def __init__(self, 
+                 freq_mask_param=10,   # 频率掩码最大长度
+                 time_mask_param=20,   # 时间掩码最大长度
+                 freq_mask_num=2,      # 频率掩码数量
+                 time_mask_num=2):     # 时间掩码数量
+        """初始化SpecAugment"""
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
+        self.freq_mask_num = freq_mask_num
+        self.time_mask_num = time_mask_num
+    
+    def __call__(self, spec):
+        """
+        应用SpecAugment到STFT频谱图
+        
+        参数:
+            spec: 频谱图，形状为 [channels, freq_bins, time_frames] 或 [batch, channels, freq_bins, time_frames]
+        
+        返回:
+            增强后的频谱图，与输入形状相同
+        """
+        if len(spec.shape) == 4:
+            # 批量处理
+            result = []
+            for i in range(spec.shape[0]):
+                result.append(self._augment_single(spec[i]))
+            return np.stack(result)
+        else:
+            # 单样本处理
+            return self._augment_single(spec)
+    
+    def _augment_single(self, spec):
+        """处理单个频谱图"""
+        # 获取频谱图形状
+        channels, freq_bins, time_frames = spec.shape
+        
+        # 创建频谱图副本以避免修改原始数据
+        augmented_spec = spec.copy()
+        
+        # 应用频率掩码
+        for i in range(self.freq_mask_num):
+            # 为每个通道生成相同的掩码，保持一致性
+            if self.freq_mask_param > 0 and freq_bins > self.freq_mask_param:
+                f = np.random.randint(0, self.freq_mask_param)
+                f0 = np.random.randint(0, freq_bins - f)
+                
+                # 应用掩码到所有通道
+                augmented_spec[:, f0:f0+f, :] = 0.0
+        
+        # 应用时间掩码
+        for i in range(self.time_mask_num):
+            if self.time_mask_param > 0 and time_frames > self.time_mask_param:
+                t = np.random.randint(0, self.time_mask_param)
+                t0 = np.random.randint(0, time_frames - t)
+                
+                # 应用掩码到所有通道
+                augmented_spec[:, :, t0:t0+t] = 0.0
+                
+        return augmented_spec
+
+
+class MixUpAugment:
+    """MixUp数据增强实现"""
+    
+    def __init__(self, alpha=0.2):
+        """
+        初始化MixUp
+        
+        参数:
+            alpha: Beta分布的参数
+        """
+        self.alpha = alpha
+        
+    def __call__(self, specs, labels, one_hot=False):
+        """
+        应用MixUp增强到批量频谱图
+        
+        参数:
+            specs: 频谱图列表，每个元素形状为 [batch, channels, freq_bins, time_frames]
+            labels: 标签，形状为 [batch]
+            one_hot: 标签是否为one-hot编码
+            
+        返回:
+            增强后的频谱图列表和混合标签
+        """
+        # 检查输入
+        assert isinstance(specs, list), "specs应该是一个列表，包含各部件的数据"
+        batch_size = specs[0].shape[0]
+        
+        # 生成混合系数
+        if self.alpha > 0:
+            lam = np.random.beta(self.alpha, self.alpha)
+        else:
+            lam = 1.0
+            
+        # 生成混合索引
+        indices = torch.randperm(batch_size)
+        
+        # 对每个部件的频谱图进行混合
+        mixed_specs = []
+        for spec in specs:
+            mixed_spec = lam * spec + (1 - lam) * spec[indices]
+            mixed_specs.append(mixed_spec)
+            
+        # 混合标签
+        if one_hot:
+            # 对于one-hot编码标签
+            mixed_labels = lam * labels + (1 - lam) * labels[indices]
+        else:
+            # 返回原始标签和混合标签以及混合比例
+            mixed_labels = (labels, labels[indices], lam)
+            
+        return mixed_specs, mixed_labels
+
+
+def apply_augmentations(component_data_list, labels, num_augmented=3):
+    """
+    应用SpecAugment和MixUp增强到数据集
+    
+    参数:
+        component_data_list: 各部件数据列表，每个元素形状为 [samples, channels, freq_bins, time_frames]
+        labels: 标签数组
+        num_augmented: 每个样本生成的增强样本数量
+        
+    返回:
+        增强后的数据列表和标签
+    """
+    
+    # 确保输入是numpy数组
+    if isinstance(labels, torch.Tensor):
+        labels = labels.numpy()
+    
+    # 初始化增强器
+    spec_augment = SpecAugment(
+        freq_mask_param=8,   # 较小的频率掩码参数，避免过度掩盖信息
+        time_mask_param=16,  # 较小的时间掩码参数
+        freq_mask_num=1,     # 减少掩码数量
+        time_mask_num=1
+    )
+    
+    # 原始样本数量
+    original_samples = len(labels)
+    unique_classes = np.unique(labels)
+    num_classes = len(unique_classes)
+    
+    # 初始化增强后的数据
+    augmented_data_list = [np.copy(data) for data in component_data_list]
+    augmented_labels = np.copy(labels)
+    
+    print(f"原始样本数: {original_samples}, 类别数: {num_classes}")
+    print(f"每个样本将生成 {num_augmented} 个增强版本")
+    
+    # 对每个类别分别处理
+    for class_idx in unique_classes:
+        # 找出该类别的样本索引
+        class_indices = np.where(labels == class_idx)[0]
+        print(f"处理类别 {class_idx}，找到 {len(class_indices)} 个原始样本")
+        
+        # 对该类别的每个样本应用SpecAugment
+        new_samples = []
+        new_labels = []
+        
+        for idx in class_indices:
+            for _ in range(num_augmented):
+                # 对每个部件应用相同的SpecAugment变换
+                augmented_samples = []
+                for component_data in component_data_list:
+                    sample = component_data[idx:idx+1]  # 保持4D形状 [1, channels, freq, time]
+                    aug_sample = spec_augment(sample)
+                    augmented_samples.append(aug_sample)
+                
+                new_samples.append(augmented_samples)
+                new_labels.append(class_idx)
+        
+        # 添加增强样本到数据集
+        for i, (augmented_samples, label) in enumerate(zip(new_samples, new_labels)):
+            for j, (component_data, aug_sample) in enumerate(zip(augmented_data_list, augmented_samples)):
+                augmented_data_list[j] = np.concatenate([augmented_data_list[j], aug_sample], axis=0)
+            
+            augmented_labels = np.append(augmented_labels, label)
+    
+    # 对整个增强后数据集应用MixUp
+    # 注意：这里只应用MixUp生成一部分样本，以保持一些原始样本的纯净性
+    mixup_ratio = 0.3  # 混合30%的样本
+    mix_indices = np.random.choice(
+        len(augmented_labels), 
+        int(mixup_ratio * len(augmented_labels)),
+        replace=False
+    )
+    
+    if len(mix_indices) >= 2:  # 确保有足够样本进行混合
+        for i in range(0, len(mix_indices)-1, 2):
+            idx1, idx2 = mix_indices[i], mix_indices[i+1]
+            # 生成混合系数
+            lam = np.random.beta(0.2, 0.2)
+            
+            # 对每个部件的数据进行混合
+            for j, component_data in enumerate(augmented_data_list):
+                # 混合两个样本
+                mixed = lam * component_data[idx1] + (1 - lam) * component_data[idx2]
+                # 替换第一个样本位置
+                augmented_data_list[j][idx1] = mixed
+            
+            # 为简单起见，我们保留混合后样本的主要类别标签
+            # 这种简化对于分类任务通常足够了
+            # 如果需要软标签，则需要修改整个训练流程
+    
+    # 打印增强后的统计信息
+    print(f"增强后样本总数: {len(augmented_labels)}")
+    print(f"增强后类别分布: {np.unique(augmented_labels, return_counts=True)}")
+    
+    return augmented_data_list, augmented_labels
+
+
+def augment_dataset_with_strategies(
+    component_data_list, labels, component_names, 
+    samples_per_class=3, use_mixup=True
+):
+    """
+    结合SpecAugment和MixUp的增强策略
+    
+    参数:
+        component_data_list: 组件数据列表，每个元素形状为[samples, channels, height, width]
+        labels: 标签
+        component_names: 组件名称列表
+        samples_per_class: 每个类别生成的额外样本数
+        use_mixup: 是否使用MixUp增强
+    
+    返回:
+        augmented_data_list: 增强后的组件数据列表
+        augmented_labels: 增强后的标签
+    """
+    # 确保所有输入都是NumPy数组
+    if isinstance(labels, torch.Tensor):
+        labels = labels.numpy()
+    
+    numpy_data_list = []
+    for data in component_data_list:
+        if isinstance(data, torch.Tensor):
+            numpy_data_list.append(data.numpy())
+        else:
+            numpy_data_list.append(data)
+    
+    # 应用SpecAugment和MixUp增强
+    augmented_data_list, augmented_labels = apply_augmentations(
+        numpy_data_list, labels, num_augmented=samples_per_class
+    )
+    
+    # 转换回PyTorch张量
+    torch_data_list = []
+    for data in augmented_data_list:
+        torch_data_list.append(torch.from_numpy(data).float())
+    
+    return torch_data_list, torch.from_numpy(augmented_labels).long()
