@@ -5,6 +5,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, Ma
 import torch
 from torch.utils.data import Dataset
 import torch.nn as nn
+import warnings
 
 class DataProcessor:
     """
@@ -131,13 +132,66 @@ class DataProcessor:
 
         return result
     
-    def apply_stft(self, signal_data, component_name=None, **kwargs):
+    # 修改方法：将短信号重复到目标长度
+    def repeat_to_target_length(self, signal, target_length):
         """
-        应用短时傅里叶变换(STFT)将时域信号转换为时频图像
+        通过重复短信号达到目标长度，适用于周期性故障信号
+        
+        参数:
+            signal: 时域信号，形状为 [timesteps, features] 或 [samples, timesteps, features]
+            target_length: 目标长度
+            
+        返回:
+            重复后的信号，达到目标长度
+        """
+        # 判断输入信号维度
+        is_batch = len(signal.shape) == 3
+        
+        if is_batch:
+            samples, current_length, n_features = signal.shape
+            
+            # 如果已经达到目标长度，直接返回
+            if current_length >= target_length:
+                return signal[:, :target_length, :]
+            
+            # 计算需要重复的次数
+            repeats_needed = int(np.ceil(target_length / current_length))
+            print(f"信号长度 {current_length} < 目标长度 {target_length}，将重复 {repeats_needed} 次")
+            
+            # 为每个样本重复信号
+            result = np.zeros((samples, target_length, n_features))
+            for i in range(samples):
+                # 对信号进行重复
+                repeated = np.tile(signal[i], (repeats_needed, 1))
+                # 截取到目标长度
+                result[i] = repeated[:target_length, :]
+                
+            return result
+        else:
+            # 处理单个样本
+            current_length, n_features = signal.shape
+            
+            # 如果已经达到目标长度，直接返回
+            if current_length >= target_length:
+                return signal[:target_length, :]
+            
+            # 计算需要重复的次数
+            repeats_needed = int(np.ceil(target_length / current_length))
+            
+            # 重复信号
+            repeated = np.tile(signal, (repeats_needed, 1))
+            # 截取到目标长度
+            return repeated[:target_length, :]
+    
+    # 修改 STFT 方法，增加重复扩展功能
+    def apply_stft(self, signal_data, component_name=None, repeat_to=None, **kwargs):
+        """
+        应用短时傅里叶变换(STFT)将时域信号转换为时频图像，增加重复扩展功能
         
         参数:
             signal_data: 时域信号，形状为 [samples, timesteps, features] 或 [timesteps, features]
             component_name: 组件名称，用于选择合适的归一化器
+            repeat_to: 目标长度，如果提供将通过重复扩展信号到此长度
             **kwargs: STFT参数
         
         返回:
@@ -147,6 +201,10 @@ class DataProcessor:
         params = self.stft_params.copy()
         params.update(kwargs)
         
+        # 如果需要重复扩展信号
+        if repeat_to is not None:
+            signal_data = self.repeat_to_target_length(signal_data, repeat_to)
+            
         # 对信号归一化
         normalized_data = self.normalize_signal(signal_data, component_name, fit=True)
         
@@ -208,9 +266,11 @@ class DataProcessor:
             # 堆叠所有样本
             return np.stack(batch_stft_results, axis=0)
     
-    def process_dataset(self, X, conditions, y=None, component_name=None, apply_stft=True, stft_params=None):
+    # 修改处理数据集方法，使用重复扩展参数
+    def process_dataset(self, X, conditions, y=None, component_name=None, apply_stft=True, 
+                        stft_params=None, repeat_to=None):
         """
-        处理数据集，专为处理单一部件设计
+        处理数据集，专为处理单一部件设计，支持信号重复扩展
         
         参数:
             X: 传感器信号数据 [samples, timesteps, features]
@@ -219,6 +279,7 @@ class DataProcessor:
             component_name: 组件名称，用于选择合适的归一化器
             apply_stft: 是否应用STFT转换
             stft_params: STFT参数
+            repeat_to: 目标信号长度，如提供将通过重复扩展信号
         
         返回:
             如果apply_stft=True：
@@ -233,8 +294,13 @@ class DataProcessor:
         if apply_stft:
             # 使用STFT转换时域数据为时频图像
             params = stft_params or {}
-            stft_images = self.apply_stft(X, component_name=component_name, **params)
+            stft_images = self.apply_stft(X, component_name=component_name, 
+                                         repeat_to=repeat_to, **params)
             return stft_images, condition_encoded, y
+        
+        # 如果需要重复扩展但不应用STFT
+        if repeat_to is not None:
+            X = self.repeat_to_target_length(X, repeat_to)
         
         # 如果不应用STFT，直接返回归一化后的数据
         normalized_data = self.normalize_signal(X, component_name=component_name, fit=True)
