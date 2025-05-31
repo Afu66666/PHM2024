@@ -179,9 +179,10 @@ def main():
         save_to_cache(test_cache, "testing_data")
     
     
-    ############################################################################
-    ######################### STFT转换 #########################################
-    ############################################################################
+
+############################################################################
+######################### STFT转换 #########################################
+############################################################################
     print("\n对各部件数据进行STFT变换...")
 
     # 设置STFT参数
@@ -192,6 +193,16 @@ def main():
         'window': 'hann',   # 窗函数
         'detrend': False,   # 不去趋势
     }
+
+    # 检测训练集和测试集的时间长度差异
+    train_length = next(iter(component_arrays_train.values())).shape[1]
+    test_length = next(iter(component_arrays_test.values())).shape[1]
+    print(f"检测到训练集样本长度: {train_length}, 测试集样本长度: {test_length}")
+
+    # 确定用于STFT的长度 - 使用训练集长度作为标准
+    target_length = train_length
+    print(f"训练集保持原始长度: {train_length}")
+    print(f"测试集将被重复扩展到: {target_length} (约 {round(target_length/test_length, 1)}倍)")
 
     # 初始化组件列表和STFT结果列表
     components = list(component_arrays_train.keys())
@@ -208,9 +219,9 @@ def main():
     # 使用批处理来提高效率
     batch_size = 16  # 可调整的批大小
 
-    # 处理训练集各部件数据
+    # 处理训练集各部件数据 - 保持原始长度
     for component_idx, component in enumerate(components):
-        print(f"处理 {component} 数据... ({component_idx+1}/{len(components)})")
+        print(f"处理 {component} 训练数据... ({component_idx+1}/{len(components)})")
         
         # 对该部件的所有样本应用STFT
         component_data = component_arrays_train[component]
@@ -232,7 +243,7 @@ def main():
             batch_labels = y_train[batch_start:batch_end] if y_train is not None else None
             
             try:
-                # 批量应用STFT（如果processor支持批处理）
+                # 批量应用STFT（不需要重复扩展）
                 batch_stft_result, _, _ = processor.process_dataset(
                     batch_samples, 
                     batch_conditions, 
@@ -240,6 +251,7 @@ def main():
                     component_name=component,
                     apply_stft=True, 
                     stft_params=stft_params
+                    # 训练集不需要重复扩展
                 )
                 
                 # 将批次结果添加到列表
@@ -260,6 +272,7 @@ def main():
                         component_name=component,
                         apply_stft=True, 
                         stft_params=stft_params
+                        # 训练集不需要重复扩展
                     )
                     
                     all_stft.append(stft_result[0])
@@ -272,9 +285,10 @@ def main():
         train_stft_components.append(np.stack(all_stft))
         print(f"  - 完成 {component} 训练数据，形状: {train_stft_components[-1].shape}")
 
-    # 处理测试集各部件数据
+    # 处理测试集各部件数据 - 使用信号重复扩展
     for component_idx, component in enumerate(components):
         print(f"处理 {component} 测试数据... ({component_idx+1}/{len(components)})")
+        print(f"  - 将测试信号重复扩展到训练集长度: {test_length} -> {target_length}")
         
         # 对该部件的所有样本应用STFT
         component_data = component_arrays_test[component]
@@ -296,14 +310,15 @@ def main():
             batch_labels = y_test[batch_start:batch_end] if y_test is not None else None
             
             try:
-                # 批量应用STFT
+                # 批量应用STFT（重复扩展到训练集长度）
                 batch_stft_result, _, _ = processor.process_dataset(
                     batch_samples, 
                     batch_conditions, 
                     batch_labels,
                     component_name=component,
                     apply_stft=True, 
-                    stft_params=stft_params
+                    stft_params=stft_params,
+                    repeat_to=target_length  # 重复扩展测试集信号
                 )
                 
                 # 将批次结果添加到列表
@@ -323,7 +338,8 @@ def main():
                         y_test[sample_idx:sample_idx+1] if y_test is not None else None,
                         component_name=component,
                         apply_stft=True, 
-                        stft_params=stft_params
+                        stft_params=stft_params,
+                        repeat_to=target_length  # 重复扩展测试集信号
                     )
                     
                     all_stft.append(stft_result[0])
@@ -335,13 +351,19 @@ def main():
     # 打印STFT处理后的形状
     print("\nSTFT处理完成，各部件STFT形状:")
     for i, comp_data in enumerate(train_stft_components):
-        print(f"部件 {components[i]}: {comp_data.shape}")
+        print(f"训练集 - 部件 {components[i]}: {comp_data.shape}")
+    for i, comp_data in enumerate(test_stft_components):
+        print(f"测试集 - 部件 {components[i]}: {comp_data.shape}")
 
     # 确保变量已正确定义，防止后续代码出错
     if len(train_stft_components) == 0 or len(test_stft_components) == 0:
         raise ValueError("STFT处理结果为空！请检查处理过程。")
 
-
+    # 验证STFT结果的时间维度是否一致
+    print("\n验证STFT结果时间维度是否一致:")
+    for i, (train_comp, test_comp) in enumerate(zip(train_stft_components, test_stft_components)):
+        print(f"部件 {components[i]}: 训练集时间维度={train_comp.shape[3]}, 测试集时间维度={test_comp.shape[3]}")
+        assert train_comp.shape[3] == test_comp.shape[3], f"部件 {components[i]} 的STFT时间维度不一致"
     ############################################################################
     ######################### 调整大小以适应预训练模型 #########################
     ############################################################################
