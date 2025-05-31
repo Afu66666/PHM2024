@@ -355,36 +355,64 @@ def main():
     ############################################################################
     ######################### 数据增强 ##########################################
     ############################################################################
-    use_gan_augmentation = True  # 可以设为变量或命令行参数
-    
-        # GAN数据增强部分
-    if use_gan_augmentation:
-        try:
-            from stft_GAN import augment_dataset_with_gan
-            
-            print("\n使用GAN增强训练数据...")
-            # 记录原始数据量
-            original_len = len(y_train)
-            
-            # 使用GAN函数进行组件和工况的联合增强
-            resized_train_components, y_train, train_conditions = augment_dataset_with_gan(
-                resized_train_components,  # 原始组件数据
-                y_train,                   # 原始标签
-                components,                # 组件名称列表
-                encoded_conditions,        # 工况数据
-                epochs=20,                 # GAN训练轮次
-                samples_per_class=5        # 每类生成5个额外样本
-            )
-            
-            # 计算新增了多少样本
-            new_len = len(y_train)
-            added_samples = new_len - original_len
-            print(f"从 {original_len} 增加到 {new_len} 样本 (增加了 {added_samples} 样本)")
-            print(f"工况数据也已同步增强，当前长度: {len(train_conditions['freq_id'])}")
-            
-        except ImportError as e:
-            print(f"无法导入GAN模块: {e}")
-            print("跳过GAN增强，继续使用原始数据...")
+    # 导入新的增强方法
+    try:
+        from spec_augment import augment_dataset_with_strategies
+        
+        print("\n使用SpecAugment和MixUp进行数据增强...")
+        # 记录原始数据量
+        original_len = len(y_train)
+        
+        # 应用SpecAugment和MixUp增强
+        resized_train_components, y_train = augment_dataset_with_strategies(
+            resized_train_components,   # 原始组件数据
+            y_train,                    # 原始标签
+            components,                 # 组件名称列表
+            samples_per_class=5,        # 每类生成5个额外样本
+            use_mixup=True              # 启用MixUp
+        )
+        
+        # 计算新增了多少样本
+        new_len = len(y_train)
+        added_samples = new_len - original_len
+        print(f"从 {original_len} 增加到 {new_len} 样本 (增加了 {added_samples} 样本)")
+        
+        # 同步更新工况数据 - 为新样本复制工况信息
+        # (1) 编码训练工况 
+        train_conditions = processor.encode_conditions_batch(conditions_train)
+        
+        # (2) 为新样本创建工况数据
+        # 对于新生成的每类样本，复制该类别现有样本的工况数据
+        # 首先找出每个类别对应的索引
+        unique_classes = np.unique(y_train[:original_len])
+        
+        # 为每个生成的样本选择对应类别的一个随机工况
+        freq_id_extended = list(train_conditions["freq_id"])
+        load_id_extended = list(train_conditions["load_id"])
+        
+        # 为每个新样本分配工况
+        for i in range(original_len, new_len):
+            class_idx = y_train[i]
+            # 找出该类别的所有原始样本索引
+            class_indices = np.where(y_train[:original_len] == class_idx)[0]
+            # 随机选择一个索引作为工况参考
+            if len(class_indices) > 0:
+                ref_idx = np.random.choice(class_indices)
+                # 复制该索引的工况
+                freq_id_extended.append(train_conditions["freq_id"][ref_idx])
+                load_id_extended.append(train_conditions["load_id"][ref_idx])
+        
+        # 更新工况数据为扩展后的结构
+        train_conditions = {
+            "freq_id": np.array(freq_id_extended),
+            "load_id": np.array(load_id_extended),
+        }
+        
+        print("工况数据已同步更新，与增强后样本数匹配")
+        
+    except ImportError as e:
+        print(f"无法导入SpecAugment模块: {e}")
+        print("跳过数据增强，继续使用原始数据...")
     ############################################################################
     ######################### 从训练集划分验证集 ###############################
         ############################################################################
