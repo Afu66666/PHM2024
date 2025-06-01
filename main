@@ -11,19 +11,19 @@ import json
 from pathlib import Path
 from data_loader import DataLoader
 from data_processor import (DataProcessor, MultiComponentDataset)
-from model_pretrain import train_model
 
-# 导入预训练模型相关功能
-from model_pretrain_improved import (
+# 导入统一的模型模块
+from model_pretrain import (
     HuggingFaceModelManager, 
     create_branch_with_hf_weights, 
     CustomMultiComponentModel,
+    ImprovedMultiComponentModel,
     train_model,
+    train_with_domain_adaptation,
     evaluate_model,
     HUGGINGFACE_AVAILABLE,
     TIMM_AVAILABLE
 )
-
 # 设置随机种子，确保结果可重现
 def set_seed(seed=42):
     np.random.seed(seed)
@@ -467,15 +467,11 @@ def main():
         print("跳过数据增强，继续使用原始数据...")
     
 
-############################################################################
-######################### 创建和训练增强多部件模型 #########################
-############################################################################
+    ############################################################################
+    ######################### 创建和训练增强多部件模型 #########################
+    ############################################################################
     # 导入改进的模型和训练函数
     try:
-        from model_pretrain_improved import (
-            ImprovedMultiComponentModel, 
-            train_with_domain_adaptation
-        )
         use_improved_model = True
         print("\n成功导入增强模型，将使用工况适应模型和域适应训练")
     except ImportError as e:
