@@ -14,7 +14,7 @@ from data_processor import (DataProcessor, MultiComponentDataset)
 from model_pretrain import train_model
 
 # 导入预训练模型相关功能
-from model_pretrain import (
+from model_pretrain_improved import (
     HuggingFaceModelManager, 
     create_branch_with_hf_weights, 
     CustomMultiComponentModel,
@@ -80,8 +80,6 @@ def main():
     hf_manager = HuggingFaceModelManager(cache_dir=hf_cache_dir)
     # 在导入部分添加
     from cache_utils import cache_exists, load_from_cache, save_to_cache
-
-    # 替换原始的数据加载代码：
 
     ############################################################################
     ######################### 数据加载###########################################
@@ -179,10 +177,42 @@ def main():
         save_to_cache(test_cache, "testing_data")
     
     
+    ############################################################################
+    ######################### 工况平衡增强 #####################################
+    ############################################################################
+    print("\n在STFT前进行工况平衡增强,模拟未知工况...")
 
-############################################################################
-######################### STFT转换 #########################################
-############################################################################
+    try:
+        # 导入工况模拟模块
+        from load_simulation import augment_with_load_simulation
+        
+        # 确保工况条件数组格式正确
+        print(f"原始工况条件数组形状: {conditions_train.shape}")
+        print(f"原始工况负载分布: {np.unique(conditions_train[:, 1], return_counts=True)}")
+        print(f"原始训练集样本数: {len(y_train)}")
+        
+        # 在原始时域信号上应用负载模拟增强
+        augmented_components, augmented_conditions, augmented_labels = augment_with_load_simulation(
+            component_arrays_train,  # 原始时域数据字典
+            conditions_train,        # 原始工况
+            y_train,                 # 原始标签
+            num_augmented=4          # 每个样本生成4个新样本(2个0kN, 2个1kN)
+        )
+        
+        # 更新训练集数据
+        component_arrays_train = augmented_components
+        conditions_train = augmented_conditions
+        y_train = augmented_labels
+        
+        print(f"工况增强后训练集样本数: {len(y_train)}")
+        print(f"工况增强后负载分布: {np.unique(conditions_train[:, 1], return_counts=True)}")
+        
+    except ImportError as e:
+        print(f"无法导入工况模拟模块: {e}")
+        print("跳过工况增强，继续使用原始数据...")
+    ############################################################################
+    ######################### STFT转换 #########################################
+    ############################################################################
     print("\n对各部件数据进行STFT变换...")
 
     # 设置STFT参数
@@ -435,6 +465,169 @@ def main():
     except ImportError as e:
         print(f"无法导入SpecAugment模块: {e}")
         print("跳过数据增强，继续使用原始数据...")
+    
+
+############################################################################
+######################### 创建和训练增强多部件模型 #########################
+############################################################################
+    # 导入改进的模型和训练函数
+    try:
+        from model_pretrain_improved import (
+            ImprovedMultiComponentModel, 
+            train_with_domain_adaptation
+        )
+        use_improved_model = True
+        print("\n成功导入增强模型，将使用工况适应模型和域适应训练")
+    except ImportError as e:
+        print(f"\n无法导入增强模型: {e}")
+        print("将使用原始模型架构")
+        use_improved_model = False
+
+    # 获取各部件通道数
+    component_channels = [data.shape[1] for data in resized_train_components]
+
+    # 使用预训练模型的选择
+    model_type = 'resnet18'  # 'googlenet', 'resnet18', 'resnet50'
+
+    # 创建组件分支
+    print(f"\n使用timm创建{model_type}模型分支...")
+    component_branches = []
+    for i, num_channels in enumerate(component_channels):
+        print(f"为部件{i} (通道数={num_channels})创建分支...")
+        branch = create_branch_with_hf_weights(
+            model_type, 
+            num_channels, 
+            pretrained=True,
+            hf_manager=hf_manager
+        )
+        component_branches.append(branch)
+
+    # 创建模型 - 选择增强模型或原始模型
+    if use_improved_model:
+        model = ImprovedMultiComponentModel(
+            branches=component_branches,
+            num_classes=num_classes,
+            working_condition=True
+        )
+        print(f"\n创建了增强的基于{model_type}的多部件模型，包含工况适应功能")
+    else:
+        model = CustomMultiComponentModel(
+            branches=component_branches,
+            num_classes=num_classes,
+            working_condition=True
+        )
+        print(f"\n创建了基于{model_type}的多部件模型，使用timm预训练权重")
+
+    model = model.to(device)
+
+    # 输出模型摘要
+    print(f"\n模型架构:")
+    print(f"- {len(model.component_branches)}个部件分支网络")
+    print(f"- 每个部件的通道数: {component_channels}")
+    print(f"- 包含工况信息: {'是' if model.working_condition else '否'}")
+    if use_improved_model:
+        print(f"- 使用增强工况适应器: 是")
+        print(f"- 使用域适应训练: 是")
+
+    # 训练模型 - 选择域适应训练或原始训练
+    if use_improved_model:
+        print("开始使用域适应训练模型...")
+        trained_model, history = train_with_domain_adaptation(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,  # 提供测试集用于域适应
+            device=device,
+            epochs=50,
+            lr=0.0005,
+            weight_decay=0.01,
+            freeze_pretrained=True,
+            unfreeze_layers=[
+                "layer3", "layer4", "condition_adapters", "condition_fusion", 
+                "visual_fusion", "final_fusion"
+            ]
+        )
+    else:
+        print("开始标准训练模型(使用冻结层和小学习率)...")
+        trained_model, history = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            epochs=50,
+            lr=0.001,
+            weight_decay=0.01,
+            freeze_pretrained=True,
+            unfreeze_layers=["layer3", "layer4", "visual_fusion", 
+                            "condition_fusion", "final_fusion"]
+        )
+
+    # 评估模型
+    print("\n在测试集上评估模型...")
+    test_acc, predictions, targets = evaluate_model(
+        model=trained_model,
+        test_loader=test_loader,
+        device=device
+    )
+
+    # 按工况分析性能
+    print("\n按工况分解测试性能:")
+    test_freqs = []
+    test_loads = []
+    test_predictions = []
+    test_ground_truth = []
+
+    # 收集测试集预测和工况信息
+    with torch.no_grad():
+        for inputs, freq_ids, load_ids, targets in test_loader:
+            # 将数据移至设备
+            inputs = [x.to(device) for x in inputs]
+            freq_ids = freq_ids.to(device)
+            load_ids = load_ids.to(device)
+            targets = targets.to(device).long().squeeze()
+            
+            # 前向传播
+            outputs = trained_model(inputs, freq_ids, load_ids)
+            
+            # 获取预测
+            _, predicted = outputs.max(1)
+            
+            # 收集数据
+            test_freqs.extend(freq_ids.cpu().numpy().flatten())
+            test_loads.extend(load_ids.cpu().numpy().flatten())
+            test_predictions.extend(predicted.cpu().numpy())
+            test_ground_truth.extend(targets.cpu().numpy())
+
+    # 频率和负载ID到实际值的映射
+    freq_map = {0: "20Hz", 1: "40Hz", 2: "60Hz"}
+    load_map = {0: "0kN", 1: "1kN", 2: "-1kN"}
+
+    # 将列表转换为NumPy数组
+    test_freqs = np.array(test_freqs)
+    test_loads = np.array(test_loads)
+    test_predictions = np.array(test_predictions)
+    test_ground_truth = np.array(test_ground_truth)
+
+    # 分析每种工况下的性能
+    unique_freqs = np.unique(test_freqs)
+    unique_loads = np.unique(test_loads)
+
+    print("\n各工况测试集性能:")
+    for freq in unique_freqs:
+        for load in unique_loads:
+            # 找出该工况下的所有样本
+            indices = np.where((test_freqs == freq) & (test_loads == load))[0]
+            if len(indices) > 0:
+                # 计算该工况下的准确率
+                correct = np.sum(test_predictions[indices] == test_ground_truth[indices])
+                accuracy = 100.0 * correct / len(indices)
+                print(f"工况 {freq_map[freq]}, {load_map[load]}: 准确率 = {accuracy:.2f}% ({correct}/{len(indices)})")
+
+    # 保存模型
+    model_prefix = "improved_" if use_improved_model else ""
+    save_path = f"{model_prefix}multi_component_{model_type}_model.pth"
+    torch.save(trained_model.state_dict(), save_path)
+    print(f"\n模型已保存至 {save_path}")
     ############################################################################
     ######################### 从训练集划分验证集 ###############################
         ############################################################################
