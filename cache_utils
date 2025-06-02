@@ -3,25 +3,15 @@ import numpy as np
 import pickle
 import time
 
-def get_cache_path(cache_dir="cache"):
-    """创建缓存目录并返回路径"""
+def get_cache_path(cache_dir="cache3"):
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
-def cache_exists(dataset_name, cache_dir="cache"):
-    """检查指定数据集的缓存是否存在"""
+def cache_exists(dataset_name, cache_dir="cache3"):
     cache_path = os.path.join(get_cache_path(cache_dir), f"{dataset_name}.pkl")
     return os.path.exists(cache_path)
 
-def save_to_cache(data_dict, dataset_name, cache_dir="cache"):
-    """
-    将数据保存到缓存
-    
-    参数:
-        data_dict: 包含数据的字典
-        dataset_name: 缓存文件名前缀 (不含扩展名)
-        cache_dir: 缓存目录
-    """
+def save_to_cache(data_dict, dataset_name, cache_dir="cache3"):
     start_time = time.time()
     print(f"正在缓存{dataset_name}数据...", end="")
     
@@ -33,17 +23,7 @@ def save_to_cache(data_dict, dataset_name, cache_dir="cache"):
     print(f" 完成! 用时: {time.time() - start_time:.2f}秒")
     print(f"缓存保存在: {os.path.abspath(cache_path)}")
 
-def load_from_cache(dataset_name, cache_dir="cache"):
-    """
-    从缓存加载数据
-    
-    参数:
-        dataset_name: 缓存文件名前缀 (不含扩展名)
-        cache_dir: 缓存目录
-        
-    返回:
-        缓存的数据字典
-    """
+def load_from_cache(dataset_name, cache_dir="cache3"):
     start_time = time.time()
     print(f"从缓存加载{dataset_name}数据...", end="")
     
@@ -57,3 +37,63 @@ def load_from_cache(dataset_name, cache_dir="cache"):
     
     print(f" 完成! 用时: {time.time() - start_time:.2f}秒")
     return data
+
+def save_stft_data(train_components, val_components, test_components,
+                 train_conditions, val_conditions, test_conditions,
+                 train_labels, val_labels, test_labels, 
+                 components, stft_params):
+    """保存划分后的STFT数据"""
+    stft_data = {
+        'train_components': train_components,
+        'val_components': val_components, 
+        'test_components': test_components,
+        'train_conditions': train_conditions,
+        'val_conditions': val_conditions,
+        'test_conditions': test_conditions,
+        'train_labels': train_labels,
+        'val_labels': val_labels,
+        'test_labels': test_labels,
+        'components': components,
+        'stft_params': stft_params
+    }
+    
+    # 保存到文件
+    with open('stft_data.pkl', 'wb') as f:
+        pickle.dump(stft_data, f)
+    
+    print("已保存STFT数据到 'stft_data.pkl'")
+
+def load_stft_data(cache_dir="cache3"):
+    """
+    加载STFT变换后的数据
+    
+    参数:
+        cache_dir: 缓存目录
+        
+    返回:
+        返回一个字典，包含STFT转换后的各种数据
+    """
+    
+    print("\n加载STFT变换后的数据...")
+    
+    # 检查缓存是否存在
+    if not cache_exists("stft_data", cache_dir=cache_dir):
+        print("未找到STFT数据缓存!")
+        return None
+    
+    # 加载数据
+    stft_cache = load_from_cache("stft_data", cache_dir=cache_dir)
+    
+    # 打印数据信息
+    train_components = stft_cache['train_components']
+    test_components = stft_cache['test_components']
+    components = stft_cache['components']
+    
+    print("STFT数据加载成功!")
+    print(f"训练样本数: {len(stft_cache['y_train'])}")
+    print(f"测试样本数: {len(stft_cache['y_test'])}")
+    
+    for i, comp_name in enumerate(components):
+        print(f"部件 {comp_name}: 训练形状={train_components[i].shape}, 测试形状={test_components[i].shape}")
+    
+    return stft_cache
