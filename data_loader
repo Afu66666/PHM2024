@@ -3,17 +3,12 @@ import numpy as np
 from pathlib import Path
 
 class DataLoader:
-    """故障诊断数据加载器 - 直接返回分离的部件NumPy数据"""
-
     def __init__(self, base_dir):
-        """初始化数据加载器"""
         self.base_dir = Path(base_dir)
-        self.data_cache = {}  # 用于缓存已加载的数据
+        self.data_cache = {}
         
-        # 组件列表
         self.components = ["gearbox", "leftaxlebox", "motor", "rightaxlebox"]
         
-        # 工况映射表
         self.sample_to_condition_map = {
             # 训练集
             ("Training", "Sample1"): {"frequency": 20, "load": -1},  # 20Hz-1kN
@@ -29,7 +24,6 @@ class DataLoader:
         }
 
     def get_fault_types(self, dataset="Training"):
-        """获取所有故障类型"""
         path = self.base_dir / dataset
         if not path.exists():
             print(f"警告: 目录 {path} 不存在")
@@ -37,7 +31,6 @@ class DataLoader:
         return [d.name for d in path.iterdir() if d.is_dir()]
 
     def get_samples(self, fault_type, dataset="Training"):
-        """获取特定故障类型的所有样本"""
         path = self.base_dir / dataset / fault_type
         if not path.exists():
             print(f"警告: 路径 {path} 不存在")
@@ -45,10 +38,8 @@ class DataLoader:
         return [d.name for d in path.iterdir() if d.is_dir()]
 
     def load_component_data(self, fault_type, sample_name, component, dataset="Training"):
-        """加载指定组件的数据"""
         cache_key = f"{dataset}_{fault_type}_{sample_name}_{component}"
         
-        # 检查缓存
         if cache_key in self.data_cache:
             return self.data_cache[cache_key]
             
@@ -58,48 +49,25 @@ class DataLoader:
             print(f"警告: 文件 {file_path} 不存在")
             return None
         
-        try:
-            data = pd.read_csv(file_path)
-            self.data_cache[cache_key] = data
-            return data
-        except Exception as e:
-            print(f"加载文件 {file_path} 出错: {e}")
-            return None
+        data = pd.read_csv(file_path)
+        self.data_cache[cache_key] = data
+        return data
 
     def get_processed_dataset(self, include_types=None, dataset="Training"):
-        """
-        获取处理后的数据集，直接返回每个组件的NumPy数组
-        
-        参数:
-        include_types: list, 可选，要包含的故障类型列表
-        dataset: str, 数据集类型 ("Training" 或 "Test")
-        
-        返回:
-        tuple: (component_arrays, labels_array, conditions_array)
-            - component_arrays: dict, 每个部件的NumPy数组，形状为 [samples, timesteps, features]
-            - labels_array: 标签NumPy数组，形状为 [samples]
-            - conditions_array: 工况NumPy数组，形状为 [samples, 2]
-        """
         fault_types = include_types or self.get_fault_types(dataset)
         
-        # 初始化组件列表
         component_data = {comp: [] for comp in self.components}
         labels = []
         conditions = []
         
-        # 遍历所有故障类型和样本
         for fault_type in fault_types:
             label = int(fault_type.replace('TYPE', ''))
             
             for sample_name in self.get_samples(fault_type, dataset):
-                # 检查每个组件并加载
                 all_components_valid = True
-                
-                # 临时存储此样本的组件数据
                 sample_components = {}
                 
                 for component in self.components:
-                    # 加载组件数据
                     comp_data = self.load_component_data(fault_type, sample_name, component, dataset)
                     
                     if comp_data is None:
@@ -107,22 +75,17 @@ class DataLoader:
                         print(f"跳过样本 {dataset}/{fault_type}/{sample_name}: 缺少 {component} 数据")
                         break
                     
-                    # 仅保留数值列
                     numeric_data = comp_data.select_dtypes(include=[np.number])
                     sample_components[component] = numeric_data.values
                 
-                # 如果任何组件缺失数据，跳过此样本
                 if not all_components_valid:
                     continue
                 
-                # 添加标签
                 labels.append(label)
                 
-                # 添加工况数据
                 condition = self.sample_to_condition_map.get((dataset, sample_name), {"frequency": 0, "load": 0})
                 conditions.append([condition["frequency"], condition["load"]])
                 
-                # 将每个组件的数据添加到对应列表
                 for component in self.components:
                     component_data[component].append(sample_components[component])
         
@@ -130,12 +93,11 @@ class DataLoader:
             print("警告: 没有找到符合条件的数据")
             return None, None, None
         
-        # 转换为NumPy数组
         labels_array = np.array(labels)
         conditions_array = np.array(conditions)
         
-        # 处理组件数据
         component_arrays = {}
         for component, samples_list in component_data.items():
-            component_arrays[component] = np.array(samples_list)        
+            component_arrays[component] = np.array(samples_list)
+        
         return component_arrays, labels_array, conditions_array
