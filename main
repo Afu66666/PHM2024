@@ -12,14 +12,13 @@ from pathlib import Path
 from data_loader import DataLoader
 from data_processor import (DataProcessor, MultiComponentDataset)
 
-# 导入统一的模型模块
+# 导入统一的模型模块 - 移除域训练相关引用
 from model_pretrain import (
     HuggingFaceModelManager, 
     create_branch_with_hf_weights, 
     CustomMultiComponentModel,
     ImprovedMultiComponentModel,
     train_model,
-    train_with_domain_adaptation,
     evaluate_model,
     HUGGINGFACE_AVAILABLE,
     TIMM_AVAILABLE
@@ -678,9 +677,9 @@ def main():
     # 创建和训练模型
     # 判断是否使用增强模型
     try:
-        # use_improved_model = True
-        use_improved_model = False
-
+        # 设置是否使用增强模型
+        use_improved_model = True
+        
     except ImportError as e:
         print(f"\n无法导入增强模型: {e}")
         print("将使用原始模型架构")
@@ -703,15 +702,13 @@ def main():
         print(f"- 每个部件的通道数: {component_channels}")
         print(f"- 包含工况信息: {'是' if model.working_condition else '否'}")
         print(f"- 使用增强工况适应器: 是")
-        print(f"- 使用域适应训练: 是")
         
-        # 使用域适应训练
-        print("开始使用域适应训练模型...")
-        trained_model, history = train_with_domain_adaptation(
+        # 使用标准训练方法
+        print("开始标准训练增强模型...")
+        trained_model, history = train_model(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
-            test_loader=test_loader,  # 提供测试集用于域适应
             device=device,
             epochs=50,
             lr=0.001,
