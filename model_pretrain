@@ -1,157 +1,30 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
-import os
-import json
-from pathlib import Path
-import torchvision.models as models
-import random
 import torch.nn.functional as F
-
-# 添加Hugging Face相关导入
-try:
-    from huggingface_hub import hf_hub_download, HfApi, list_models
-    from transformers import AutoConfig, AutoModel
-    HUGGINGFACE_AVAILABLE = True
-except ImportError:
-    print("警告: 未安装huggingface_hub或transformers库，将使用标准PyTorch模型。")
-    print("可使用 'pip install huggingface_hub transformers' 安装。")
-    HUGGINGFACE_AVAILABLE = False
-
-# 添加timm库支持
-try:
-    import timm
-    TIMM_AVAILABLE = True
-except ImportError:
-    print("警告: 未安装timm库，将使用标准PyTorch模型。")
-    print("可使用 'pip install timm' 安装。")
-    TIMM_AVAILABLE = False
-
+import timm
 
 class HuggingFaceModelManager:
-    """管理Hugging Face预训练模型的下载和使用"""
-    
     def __init__(self, cache_dir=None):
-        """
-        初始化Hugging Face模型管理器
-        
-        参数:
-            cache_dir: 模型缓存目录，如果为None则使用默认路径
-        """
         self.cache_dir = cache_dir or os.path.expanduser("~/huggingface_models")
         os.makedirs(self.cache_dir, exist_ok=True)
         
         # 映射模型名称到Hugging Face仓库ID
         self.model_mapping = {
             'resnet18': 'microsoft/resnet-18',
-            'resnet34': 'microsoft/resnet-34',
-            'resnet50': 'microsoft/resnet-50',
-            'resnet101': 'microsoft/resnet-101',
-            'googlenet': 'timm/googlenet', 
-            'efficientnet_b0': 'timm/efficientnet_b0'
         }
-        
-        # 模型文件信息
-        self.model_files = {
-            'microsoft/resnet-18': {'weights': 'pytorch_model.bin', 'config': 'config.json'},
-            'microsoft/resnet-34': {'weights': 'pytorch_model.bin', 'config': 'config.json'},
-            'microsoft/resnet-50': {'weights': 'pytorch_model.bin', 'config': 'config.json'},
-            'microsoft/resnet-101': {'weights': 'pytorch_model.bin', 'config': 'config.json'}
-        }
-        
-        # 记录已下载的模型
-        self.downloaded_models = {}
-        
-        # 设置timm缓存目录
-        if cache_dir:
-            os.environ['TORCH_HOME'] = cache_dir
-    
-    # 保留原方法以保持兼容性
+
     def download_model(self, model_name):
-        """保留旧方法签名以保持兼容性"""
-        # 使用timm时，这个方法不再需要下载权重
-        if TIMM_AVAILABLE:
-            print(f"使用timm库，无需手动下载{model_name}模型权重。")
-            return {'model_name': model_name}
-        else:
-            # 如果timm不可用，保留原逻辑
-            return self._download_model_original(model_name)
-    
-    def _download_model_original(self, model_name):
-        """原始下载方法，现在作为备份"""
-        if not HUGGINGFACE_AVAILABLE:
-            print(f"警告: 未安装huggingface_hub库，无法下载{model_name}模型。")
-            return None
-        
-        # 获取Hugging Face仓库ID
-        repo_id = self.model_mapping.get(model_name)
-        if not repo_id:
-            print(f"警告: 未找到{model_name}的Hugging Face映射。")
-            return None
-        
-        # 检查是否已下载
-        if model_name in self.downloaded_models:
-            print(f"模型{model_name}已下载，使用缓存版本。")
-            return self.downloaded_models[model_name]
-        
-        # 获取文件信息
-        files_info = self.model_files.get(repo_id)
-        if not files_info:
-            print(f"警告: 未找到{repo_id}的文件信息。")
-            return None
-        
-        try:
-            print(f"正在从Hugging Face下载{model_name}模型...")
-            result = {}
-            
-            # 下载权重文件
-            weights_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=files_info['weights'],
-                cache_dir=self.cache_dir
-            )
-            result['weights'] = weights_path
-            
-            # 下载配置文件
-            config_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=files_info['config'],
-                cache_dir=self.cache_dir
-            )
-            result['config'] = config_path
-            
-            print(f"成功下载{model_name}模型:")
-            print(f"  - 权重文件: {weights_path}")
-            print(f"  - 配置文件: {config_path}")
-            
-            # 缓存结果
-            self.downloaded_models[model_name] = result
-            return result
-            
-        except Exception as e:
-            print(f"下载{model_name}时出错: {e}")
-            return None
+        print(f"使用timm库，无需手动下载{model_name}模型权重。")
+        return {'model_name': model_name}
     
     def load_model_weights(self, model_name, torchvision_model):
-        """保留旧方法签名以保持兼容性"""
-        # 这个方法将不再用于加载权重，由create_branch_with_timm替代
         print(f"使用timm库加载{model_name}，忽略传入的torchvision模型。")
         return torchvision_model
 
 
 def create_branch_with_hf_weights(model_type, num_channels, pretrained=True, hf_manager=None):
-    """
-    使用timm库创建预训练模型分支
-    
-    参数:
-        model_type: 模型类型，如'resnet18'
-        num_channels: 输入通道数
-        pretrained: 是否使用预训练权重
-        hf_manager: 为了保持兼容性，现在不再使用
-        
-    返回:
-        不含分类层的模型分支
-    """
     try:
         # 准备timm模型名称
         timm_model_name = model_type
@@ -161,7 +34,7 @@ def create_branch_with_hf_weights(model_type, num_channels, pretrained=True, hf_
         model = timm.create_model(
             timm_model_name,
             pretrained=pretrained,
-            in_chans=num_channels,  # 指定输入通道数
+            in_chans=num_channels,
             num_classes=0,  # 返回特征，不包括分类器
         )
         
@@ -173,81 +46,7 @@ def create_branch_with_hf_weights(model_type, num_channels, pretrained=True, hf_
         return None
 
 
-class CustomMultiComponentModel(nn.Module):
-    """使用预训练权重的多部件故障诊断模型"""
-    
-    def __init__(self, branches, num_classes, working_condition=True):
-        super().__init__()
-        self.component_branches = nn.ModuleList(branches)
-        self.working_condition = working_condition
-        self.num_components = len(branches)
-        
-        # 特征维度，根据ResNet18
-        feature_dim = 512
-        
-        # 工况嵌入
-        if working_condition:
-            self.freq_embedding = nn.Embedding(3, 32)  # 3种频率
-            self.load_embedding = nn.Embedding(3, 32)  # 3种负载
-            
-        # 先处理视觉特征
-        self.visual_fusion = nn.Sequential(
-            nn.Linear(feature_dim * self.num_components, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.4)
-        )
-
-        # 处理工况特征
-        self.condition_fusion = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-
-        # 融合两种特征
-        self.final_fusion = nn.Sequential(
-            nn.Linear(128 + 32, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(64, num_classes)
-        )
-    
-    def forward(self, x_list, freq_id=None, load_id=None):
-        # 确保输入的部件数量与分支数量一致
-        assert len(x_list) == self.num_components, f"Expected {self.num_components} components, got {len(x_list)}"
-        
-        # 从每个部件提取特征
-        features = []
-        for i, x in enumerate(x_list):
-            feat = self.component_branches[i](x)
-            # 平坦化特征
-            if len(feat.shape) > 2:
-                feat = feat.view(feat.size(0), -1)
-            features.append(feat)
-        
-        # 拼接所有部件的特征
-        combined_features = torch.cat(features, dim=1)
-        
-        freq_embed = self.freq_embedding(freq_id.squeeze())
-        load_embed = self.load_embedding(load_id.squeeze())
-        # 逐步融合工况与特征
-        # 通过工况特征融合层
-        condition_embedding = torch.cat([freq_embed, load_embed], dim=1)
-        condition_hidden = self.condition_fusion(condition_embedding)
-        # 通过视觉特征融合层
-        feature_hidden = self.visual_fusion(combined_features)
-        # 通过融合层
-        output = self.final_fusion(torch.cat([feature_hidden, condition_hidden], dim=1))
-        
-        return output
-
-
-# 从model_pretrain_improved.py添加的类和函数
-
 class WorkingConditionAdapter(nn.Module):
-    """工况适配器，根据工况动态调整特征"""
     def __init__(self, feature_dim=512, embed_dim=64):
         super().__init__()
         # 工况嵌入
@@ -268,14 +67,6 @@ class WorkingConditionAdapter(nn.Module):
         self.condition_encoder[-1].bias.data.zero_()
     
     def forward(self, features, freq_id, load_id):
-        """
-        使用FiLM风格的工况调制
-        
-        参数:
-            features: 输入特征 [batch_size, feature_dim]
-            freq_id: 频率ID [batch_size]
-            load_id: 负载ID [batch_size]
-        """
         # 获取工况嵌入
         freq_embed = self.freq_embedding(freq_id.squeeze())
         load_embed = self.load_embedding(load_id.squeeze())
@@ -298,8 +89,6 @@ class WorkingConditionAdapter(nn.Module):
 
 
 class ImprovedMultiComponentModel(nn.Module):
-    """增强的多部件故障诊断模型，改进工况适应能力"""
-    
     def __init__(self, branches, num_classes, working_condition=True):
         super().__init__()
         self.component_branches = nn.ModuleList(branches)
@@ -394,16 +183,6 @@ class ImprovedMultiComponentModel(nn.Module):
 
 
 def freeze_pretrained_layers(model, unfreeze_layers=None):
-    """
-    冻结模型大部分层，只保留指定层可训练
-    
-    参数:
-        model: 要冻结的模型
-        unfreeze_layers: 不冻结的层名列表，例如["layer4", "fusion"]
-    
-    返回:
-        model: 冻结后的模型
-    """
     if unfreeze_layers is None:
         unfreeze_layers = []
         
@@ -433,13 +212,11 @@ def freeze_pretrained_layers(model, unfreeze_layers=None):
 def train_model(
     model, train_loader, val_loader, device, 
     epochs=30, 
-    lr=0.00005,  # 使用非常小的学习率
-    weight_decay=0.01,  # 增大权重衰减
-    freeze_pretrained=True,  # 是否冻结预训练层
-    unfreeze_layers=None  # 哪些层不冻结
+    lr=0.00005,
+    weight_decay=0.01,
+    freeze_pretrained=True,
+    unfreeze_layers=None
 ):
-    """改进的训练模型函数，整合了冻结层和小学习率"""
-    
     # 如果需要冻结层
     if freeze_pretrained:
         model = freeze_pretrained_layers(model, unfreeze_layers)
@@ -480,7 +257,7 @@ def train_model(
             inputs = [x.to(device) for x in inputs]
             freq_ids = freq_ids.to(device)
             load_ids = load_ids.to(device)
-            targets = targets.to(device).long().squeeze()  # 确保long类型
+            targets = targets.to(device).long().squeeze()
             
             # 梯度清零
             optimizer.zero_grad()
@@ -531,7 +308,7 @@ def train_model(
                 inputs = [x.to(device) for x in inputs]
                 freq_ids = freq_ids.to(device)
                 load_ids = load_ids.to(device)
-                targets = targets.to(device).long().squeeze()  # 确保long类型
+                targets = targets.to(device).long().squeeze()
                 
                 # 前向传播
                 outputs = model(inputs, freq_ids, load_ids)
@@ -571,10 +348,6 @@ def train_model(
         else:
             counter += 1
         
-        # 打印预测分布
-        print(f"验证集预测标签分布: {np.unique(all_preds, return_counts=True)}")
-        print(f"验证集真实标签分布: {np.unique(all_targets, return_counts=True)}")
-        
         print(f'轮次: {epoch+1}/{epochs} | '
               f'训练损失: {train_loss:.4f} | 训练准确率: {train_acc:.2f}% | '
               f'验证损失: {val_loss:.4f} | 验证准确率: {val_acc:.2f}%')
@@ -602,7 +375,6 @@ def train_model(
 
 
 def evaluate_model(model, test_loader, device):
-    """评估模型函数"""
     model.eval()
     correct = 0
     total = 0
@@ -611,25 +383,20 @@ def evaluate_model(model, test_loader, device):
     
     with torch.no_grad():
         for inputs, freq_ids, load_ids, targets in test_loader:
-            # 将数据移至设备
             inputs = [x.to(device) for x in inputs]
             freq_ids = freq_ids.to(device)
             load_ids = load_ids.to(device)
             targets = targets.to(device).long().squeeze()
             
-            # 前向传播
             outputs = model(inputs, freq_ids, load_ids)
             
-            # 统计
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
             
-            # 收集预测和目标
             all_preds.extend(predicted.cpu().numpy())
             all_targets.extend(targets.cpu().numpy())
     
-    # 计算准确率
     accuracy = 100. * correct / total
     print(f'测试集准确率: {accuracy:.2f}%')
     
