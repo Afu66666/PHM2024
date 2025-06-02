@@ -1,262 +1,231 @@
 import numpy as np
-import torch
-import torch.nn as nn
 import random
 
-class SpecAugment:
-    """SpecAugment实现，用于STFT频谱图数据增强"""
-    
-    def __init__(self, 
-                 freq_mask_param=10,   # 频率掩码最大长度
-                 time_mask_param=20,   # 时间掩码最大长度
-                 freq_mask_num=2,      # 频率掩码数量
-                 time_mask_num=2):     # 时间掩码数量
-        """初始化SpecAugment"""
-        self.freq_mask_param = freq_mask_param
-        self.time_mask_param = time_mask_param
-        self.freq_mask_num = freq_mask_num
-        self.time_mask_num = time_mask_num
-    
-    def __call__(self, spec):
-        """
-        应用SpecAugment到STFT频谱图
-        
-        参数:
-            spec: 频谱图，形状为 [channels, freq_bins, time_frames] 或 [batch, channels, freq_bins, time_frames]
-        
-        返回:
-            增强后的频谱图，与输入形状相同
-        """
-        if len(spec.shape) == 4:
-            # 批量处理
-            result = []
-            for i in range(spec.shape[0]):
-                result.append(self._augment_single(spec[i]))
-            return np.stack(result)
-        else:
-            # 单样本处理
-            return self._augment_single(spec)
-    
-    def _augment_single(self, spec):
-        """处理单个频谱图"""
-        # 获取频谱图形状
-        channels, freq_bins, time_frames = spec.shape
-        
-        # 创建频谱图副本以避免修改原始数据
-        augmented_spec = spec.copy()
-        
-        # 应用频率掩码
-        for i in range(self.freq_mask_num):
-            # 为每个通道生成相同的掩码，保持一致性
-            if self.freq_mask_param > 0 and freq_bins > self.freq_mask_param:
-                f = np.random.randint(0, self.freq_mask_param)
-                f0 = np.random.randint(0, freq_bins - f)
-                
-                # 应用掩码到所有通道
-                augmented_spec[:, f0:f0+f, :] = 0.0
-        
-        # 应用时间掩码
-        for i in range(self.time_mask_num):
-            if self.time_mask_param > 0 and time_frames > self.time_mask_param:
-                t = np.random.randint(0, self.time_mask_param)
-                t0 = np.random.randint(0, time_frames - t)
-                
-                # 应用掩码到所有通道
-                augmented_spec[:, :, t0:t0+t] = 0.0
-                
-        return augmented_spec
-
-
-class MixUpAugment:
-    """MixUp数据增强实现"""
-    
-    def __init__(self, alpha=0.2):
-        """
-        初始化MixUp
-        
-        参数:
-            alpha: Beta分布的参数
-        """
-        self.alpha = alpha
-        
-    def __call__(self, specs, labels, one_hot=False):
-        """
-        应用MixUp增强到批量频谱图
-        
-        参数:
-            specs: 频谱图列表，每个元素形状为 [batch, channels, freq_bins, time_frames]
-            labels: 标签，形状为 [batch]
-            one_hot: 标签是否为one-hot编码
-            
-        返回:
-            增强后的频谱图列表和混合标签
-        """
-        # 检查输入
-        assert isinstance(specs, list), "specs应该是一个列表，包含各部件的数据"
-        batch_size = specs[0].shape[0]
-        
-        # 生成混合系数
-        if self.alpha > 0:
-            lam = np.random.beta(self.alpha, self.alpha)
-        else:
-            lam = 1.0
-            
-        # 生成混合索引
-        indices = torch.randperm(batch_size)
-        
-        # 对每个部件的频谱图进行混合
-        mixed_specs = []
-        for spec in specs:
-            mixed_spec = lam * spec + (1 - lam) * spec[indices]
-            mixed_specs.append(mixed_spec)
-            
-        # 混合标签
-        if one_hot:
-            # 对于one-hot编码标签
-            mixed_labels = lam * labels + (1 - lam) * labels[indices]
-        else:
-            # 返回原始标签和混合标签以及混合比例
-            mixed_labels = (labels, labels[indices], lam)
-            
-        return mixed_specs, mixed_labels
-
-
-def apply_augmentations(component_data_list, labels, num_augmented=3):
+def time_mask(spec, T=5, num_masks=1, replace_with_zero=True):
     """
-    应用SpecAugment和MixUp增强到数据集
+    应用时间掩码
     
     参数:
-        component_data_list: 各部件数据列表，每个元素形状为 [samples, channels, freq_bins, time_frames]
+        spec: 时频图像，形状为 [channels, freq_bins, time_frames]
+        T: 最大掩码时间长度
+        num_masks: 掩码数量
+        replace_with_zero: 是否用零替换（否则用均值）
+    
+    返回:
+        掩码后的图像
+    """
+    cloned = spec.copy()
+    channels, freq_bins, time_frames = cloned.shape
+    
+    for c in range(channels):
+        for i in range(num_masks):
+            t = np.random.randint(0, T)
+            t0 = np.random.randint(0, time_frames - t)
+            
+            if replace_with_zero:
+                cloned[c, :, t0:t0+t] = 0
+            else:
+                cloned[c, :, t0:t0+t] = cloned[c, :, :].mean()
+    return cloned
+
+def freq_mask(spec, F=5, num_masks=1, replace_with_zero=True):
+    """应用频率掩码"""
+    cloned = spec.copy()
+    channels, freq_bins, time_frames = cloned.shape
+    
+    for c in range(channels):
+        for i in range(num_masks):
+            f = np.random.randint(0, F)
+            f0 = np.random.randint(0, freq_bins - f)
+            
+            if replace_with_zero:
+                cloned[c, f0:f0+f, :] = 0
+            else:
+                cloned[c, f0:f0+f, :] = cloned[c, :, :].mean()
+    return cloned
+
+def spec_augment(spec, time_warping=False, time_mask_param=10, 
+                frequency_mask_param=10, n_time_masks=2, n_freq_masks=2):
+    """应用SpecAugment数据增强"""
+    
+    # 应用频率掩码
+    augmented_spec = freq_mask(spec, F=frequency_mask_param, num_masks=n_freq_masks)
+    
+    # 应用时间掩码
+    augmented_spec = time_mask(augmented_spec, T=time_mask_param, num_masks=n_time_masks)
+    
+    return augmented_spec
+
+def diagonal_mask(spec, max_width=10, num_masks=1, replace_with_zero=True):
+    """
+    应用对角线掩码
+    
+    参数:
+        spec: 时频图像，形状为 [channels, freq_bins, time_frames]
+        max_width: 最大掩码宽度
+        num_masks: 掩码数量
+        replace_with_zero: 是否用零替换
+    
+    返回:
+        掩码后的图像
+    """
+    cloned = spec.copy()
+    channels, freq_bins, time_frames = cloned.shape
+    
+    for c in range(channels):
+        for i in range(num_masks):
+            # 随机选择对角线方向 (正或负)
+            direction = 1 if np.random.random() > 0.5 else -1
+            
+            # 确定对角线宽度
+            width = np.random.randint(1, max_width)
+            
+            # 随机选择起始点
+            start_freq = np.random.randint(0, freq_bins)
+            start_time = np.random.randint(0, time_frames)
+            
+            # 创建掩码
+            for offset in range(min(freq_bins, time_frames)):
+                f_idx = start_freq + offset
+                t_idx = start_time + direction * offset
+                
+                # 检查索引是否在范围内
+                if 0 <= f_idx < freq_bins and 0 <= t_idx < time_frames:
+                    # 应用宽度
+                    for w in range(-width//2, width//2 + 1):
+                        f = f_idx + w
+                        if 0 <= f < freq_bins:
+                            if replace_with_zero:
+                                cloned[c, f, t_idx] = 0
+                            else:
+                                cloned[c, f, t_idx] = cloned[c].mean()
+    
+    return cloned
+
+def random_erasing(spec, erase_ratio=0.05, num_blocks=2):
+    """
+    随机擦除块
+    
+    参数:
+        spec: 时频图像，形状为 [channels, freq_bins, time_frames]
+        erase_ratio: 擦除区域占总区域的比例
+        num_blocks: 要擦除的块数
+    
+    返回:
+        擦除后的图像
+    """
+    cloned = spec.copy()
+    channels, freq_bins, time_frames = cloned.shape
+    
+    area = freq_bins * time_frames
+    target_area = area * erase_ratio / num_blocks
+    
+    for c in range(channels):
+        for _ in range(num_blocks):
+            # 计算擦除块的尺寸
+            aspect_ratio = np.random.uniform(0.3, 1.0/0.3)
+            h = int(np.sqrt(target_area * aspect_ratio))
+            w = int(np.sqrt(target_area / aspect_ratio))
+            
+            # 确保尺寸在合理范围内
+            h = min(h, freq_bins)
+            w = min(w, time_frames)
+            
+            # 随机选择左上角
+            f0 = np.random.randint(0, freq_bins - h + 1)
+            t0 = np.random.randint(0, time_frames - w + 1)
+            
+            # 擦除区块
+            cloned[c, f0:f0+h, t0:t0+w] = 0
+    
+    return cloned
+
+def augment_dataset_with_strategies(components_data, labels, component_names, samples_per_class=3):
+    """
+    使用多种增强策略增强数据集
+    
+    参数:
+        components_data: 列表，包含每个部件的数据，形状为 [samples, channels, freq_bins, time_frames]
         labels: 标签数组
-        num_augmented: 每个样本生成的增强样本数量
-        
-    返回:
-        增强后的数据列表和标签
-    """
-    
-    # 确保输入是numpy数组
-    if isinstance(labels, torch.Tensor):
-        labels = labels.numpy()
-    
-    # 初始化增强器
-    spec_augment = SpecAugment(
-        freq_mask_param=8,   # 较小的频率掩码参数，避免过度掩盖信息
-        time_mask_param=16,  # 较小的时间掩码参数
-        freq_mask_num=1,     # 减少掩码数量
-        time_mask_num=1
-    )
-    
-    # 原始样本数量
-    original_samples = len(labels)
-    unique_classes = np.unique(labels)
-    num_classes = len(unique_classes)
-    
-    # 初始化增强后的数据
-    augmented_data_list = [np.copy(data) for data in component_data_list]
-    augmented_labels = np.copy(labels)
-    
-    print(f"原始样本数: {original_samples}, 类别数: {num_classes}")
-    print(f"每个样本将生成 {num_augmented} 个增强版本")
-    
-    # 对每个类别分别处理
-    for class_idx in unique_classes:
-        # 找出该类别的样本索引
-        class_indices = np.where(labels == class_idx)[0]
-        print(f"处理类别 {class_idx}，找到 {len(class_indices)} 个原始样本")
-        
-        # 对该类别的每个样本应用SpecAugment
-        new_samples = []
-        new_labels = []
-        
-        for idx in class_indices:
-            for _ in range(num_augmented):
-                # 对每个部件应用相同的SpecAugment变换
-                augmented_samples = []
-                for component_data in component_data_list:
-                    sample = component_data[idx:idx+1]  # 保持4D形状 [1, channels, freq, time]
-                    aug_sample = spec_augment(sample)
-                    augmented_samples.append(aug_sample)
-                
-                new_samples.append(augmented_samples)
-                new_labels.append(class_idx)
-        
-        # 添加增强样本到数据集
-        for i, (augmented_samples, label) in enumerate(zip(new_samples, new_labels)):
-            for j, (component_data, aug_sample) in enumerate(zip(augmented_data_list, augmented_samples)):
-                augmented_data_list[j] = np.concatenate([augmented_data_list[j], aug_sample], axis=0)
-            
-            augmented_labels = np.append(augmented_labels, label)
-    
-    # 对整个增强后数据集应用MixUp
-    # 注意：这里只应用MixUp生成一部分样本，以保持一些原始样本的纯净性
-    mixup_ratio = 0.3  # 混合30%的样本
-    mix_indices = np.random.choice(
-        len(augmented_labels), 
-        int(mixup_ratio * len(augmented_labels)),
-        replace=False
-    )
-    
-    if len(mix_indices) >= 2:  # 确保有足够样本进行混合
-        for i in range(0, len(mix_indices)-1, 2):
-            idx1, idx2 = mix_indices[i], mix_indices[i+1]
-            # 生成混合系数
-            lam = np.random.beta(0.2, 0.2)
-            
-            # 对每个部件的数据进行混合
-            for j, component_data in enumerate(augmented_data_list):
-                # 混合两个样本
-                mixed = lam * component_data[idx1] + (1 - lam) * component_data[idx2]
-                # 替换第一个样本位置
-                augmented_data_list[j][idx1] = mixed
-            
-            # 为简单起见，我们保留混合后样本的主要类别标签
-            # 这种简化对于分类任务通常足够了
-            # 如果需要软标签，则需要修改整个训练流程
-    
-    # 打印增强后的统计信息
-    print(f"增强后样本总数: {len(augmented_labels)}")
-    print(f"增强后类别分布: {np.unique(augmented_labels, return_counts=True)}")
-    
-    return augmented_data_list, augmented_labels
-
-
-def augment_dataset_with_strategies(
-    component_data_list, labels, component_names, 
-    samples_per_class=3, use_mixup=True
-):
-    """
-    结合SpecAugment和MixUp的增强策略
-    
-    参数:
-        component_data_list: 组件数据列表，每个元素形状为[samples, channels, height, width]
-        labels: 标签
         component_names: 组件名称列表
-        samples_per_class: 每个类别生成的额外样本数
-        use_mixup: 是否使用MixUp增强
+        samples_per_class: 每个类别增加的样本数量
     
     返回:
-        augmented_data_list: 增强后的组件数据列表
-        augmented_labels: 增强后的标签
+        augmented_components, augmented_labels
     """
-    # 确保所有输入都是NumPy数组
-    if isinstance(labels, torch.Tensor):
-        labels = labels.numpy()
+    # 转换为NumPy数组以便处理
+    if isinstance(labels, list):
+        labels = np.array(labels)
+        
+    original_len = len(labels)
+    num_components = len(components_data)
     
-    numpy_data_list = []
-    for data in component_data_list:
-        if isinstance(data, torch.Tensor):
-            numpy_data_list.append(data.numpy())
-        else:
-            numpy_data_list.append(data)
+    # 获取每个类别的索引
+    unique_classes = np.unique(labels)
+    class_indices = {cls: np.where(labels == cls)[0] for cls in unique_classes}
     
-    # 应用SpecAugment和MixUp增强
-    augmented_data_list, augmented_labels = apply_augmentations(
-        numpy_data_list, labels, num_augmented=samples_per_class
-    )
+    # 创建增强数据列表
+    augmented_components = [comp.copy() for comp in components_data]
+    augmented_labels = labels.copy()
     
-    # 转换回PyTorch张量
-    torch_data_list = []
-    for data in augmented_data_list:
-        torch_data_list.append(torch.from_numpy(data).float())
+    print(f"开始SpecAugment数据增强，每个类别将增加 {samples_per_class} 个样本")
+    print(f"原始样本数: {len(labels)}")
     
-    return torch_data_list, torch.from_numpy(augmented_labels).long()
+    # 增强策略列表
+    augmentation_methods = [
+        # 基本SpecAugment
+        lambda x: spec_augment(x, time_mask_param=max(5, int(x.shape[2] * 0.1)), 
+                              frequency_mask_param=max(5, int(x.shape[1] * 0.1)),
+                              n_time_masks=2, n_freq_masks=2),
+        
+        # 更强的时间掩码
+        lambda x: spec_augment(x, time_mask_param=max(10, int(x.shape[2] * 0.2)), 
+                              frequency_mask_param=max(5, int(x.shape[1] * 0.1)),
+                              n_time_masks=3, n_freq_masks=1),
+        
+        # 更强的频率掩码
+        lambda x: spec_augment(x, time_mask_param=max(5, int(x.shape[2] * 0.1)), 
+                              frequency_mask_param=max(10, int(x.shape[1] * 0.2)),
+                              n_time_masks=1, n_freq_masks=3),
+        
+        # 对角线掩码
+        lambda x: diagonal_mask(x, max_width=6, num_masks=2),
+        
+        # 随机擦除
+        lambda x: random_erasing(x, erase_ratio=0.07, num_blocks=3)
+    ]
+    
+    # 对每个类别应用增强
+    for cls in unique_classes:
+        cls_indices = class_indices[cls]
+        if len(cls_indices) == 0:
+            continue
+        
+        # 为每个类别创建新样本
+        for i in range(samples_per_class):
+            # 随机选择一个样本
+            idx = np.random.choice(cls_indices)
+            
+            # 随机选择一种增强方法
+            aug_method = np.random.choice(augmentation_methods)
+            
+            # 对每个部件应用所选的增强
+            new_component_samples = []
+            for comp_idx in range(num_components):
+                sample = components_data[comp_idx][idx].copy()
+                augmented = aug_method(sample)
+                new_component_samples.append(augmented)
+            
+            # 添加增强后的样本
+            for comp_idx in range(num_components):
+                augmented_components[comp_idx] = np.vstack([
+                    augmented_components[comp_idx], 
+                    new_component_samples[comp_idx][np.newaxis, :]
+                ])
+            augmented_labels = np.append(augmented_labels, cls)
+    
+    new_len = len(augmented_labels)
+    added_samples = new_len - original_len
+    print(f"增强完成，从 {original_len} 增加到 {new_len} 样本 (增加了 {added_samples} 样本)")
+    
+    return augmented_components, augmented_labels
