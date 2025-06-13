@@ -1,748 +1,789 @@
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader as TorchDataLoader
-from sklearn.model_selection import train_test_split
+
 import os
-from pathlib import Path
-from data_loader import DataLoader
-from data_processor import (DataProcessor, MultiComponentDataset)
-from load_simulation import augment_with_load_simulation
-from spec_augment import augment_dataset_with_strategies
-from model_pretrain import (
-    HuggingFaceModelManager, 
-    create_branch_with_hf_weights, 
-    ImprovedMultiComponentModel,
-    train_model,
-    evaluate_model
-)
-from cache_utils import cache_exists, load_from_cache, save_to_cache, save_stft_data, load_stft_data
-import timm
-import torch.nn.functional as F
+import argparse
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import time
 
-# 设置随机种子，确保结果可重现
-def set_seed(seed=42):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+from config import config
+from utils.data_cache import cache_exists, load_from_cache, save_to_cache, get_cache_path
+from utils.data_loader import DataLoader as CustomDataLoader
 
-# 调整STFT图像大小的函数
-def resize_stft_images(stft_images, target_size=(224, 224)):
-    resized_list = []
-    for component_data in stft_images:
-        tensor_data = torch.from_numpy(component_data).float()
-        resized = F.interpolate(
-            tensor_data, 
-            size=target_size,
-            mode='bilinear',
-            align_corners=False
+def parse_args():
+    parser = argparse.ArgumentParser(description="基于Vision Transformer的故障诊断流程")
+    parser.add_argument("--mode", type=str, default="all", choices=["preprocess", "pretrain", "finetune", "evaluate", "all"],
+                        help="运行模式")
+    parser.add_argument("--data_path", type=str, default="Datasets",
+                        help="数据目录路径")
+    parser.add_argument("--output_dir", type=str, default=config.OUTPUT_DIR,
+                        help="输出目录")
+    parser.add_argument("--pretrained_weights", type=str, default=os.path.join(config.OUTPUT_DIR, "pretrained_encoder.pth"),
+                        help="预训练权重路径")
+    parser.add_argument("--final_model_path", type=str, default=os.path.join(config.OUTPUT_DIR, "final_model.pth"),
+                        help="最终模型路径")
+    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE,
+                        help="批次大小")
+    parser.add_argument("--pretrain_epochs", type=int, default=config.PRETRAIN_EPOCHS,
+                        help="预训练轮数")
+    parser.add_argument("--finetune_epochs", type=int, default=config.FINETUNE_EPOCHS,
+                        help="微调轮数")
+    parser.add_argument("--k_folds", type=int, default=config.K_FOLDS,
+                        help="交叉验证折数")
+    parser.add_argument("--use_cache", action="store_true", default=True,
+                        help="是否使用缓存数据")
+    parser.add_argument("--visualize", action="store_true",
+                        help="可视化样本")
+    return parser.parse_args()
+
+def preprocess(args):
+    """数据预处理"""
+    print("\n" + "="*50)
+    print("开始数据预处理...")
+    
+    from utils.data_processing import prepare_dataset, prepare_test_dataset
+    from utils.visualization import plot_stft
+    
+    # 检查数据路径
+    if not os.path.exists(args.data_path):
+        raise FileNotFoundError(f"数据目录未找到: {args.data_path}")
+    
+    # 处理训练数据
+    train_data, train_labels, train_conditions = prepare_dataset(
+        args.data_path, 
+        use_cache=args.use_cache
+    )
+    
+    # 处理测试数据
+    test_data, test_labels, test_conditions = prepare_test_dataset(
+        args.data_path,
+        use_cache=args.use_cache
+    )
+    
+    print(f"数据预处理完成")
+    print(f"训练数据形状: {train_data.shape}, 标签形状: {train_labels.shape}")
+    print(f"测试数据形状: {test_data.shape}, 标签形状: {test_labels.shape}")
+    print("="*50)
+    
+    # 可视化一些样本
+    if args.visualize:
+        # 可视化几个样本
+        num_samples = min(5, len(train_data))
+        plt.figure(figsize=(15, 10))
+        
+        for i in range(num_samples):
+            plt.subplot(num_samples, 1, i+1)
+            plt.imshow(train_data[i][0], aspect='auto', origin='lower', cmap='viridis')
+            plt.colorbar(format='%+2.0f dB')
+            plt.title(f"样本 {i+1}, 类别 {train_labels[i]+1}")
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.output_dir, "sample_visualizations.png"))
+        plt.close()
+
+def pretrain(args):
+    """模型预训练"""
+    print("\n" + "="*50)
+    print("开始模型预训练...")
+    
+    # 导入预训练所需模块
+    from models.pretrain_model import MaskedAutoencoderViT
+    from utils.data_processing import prepare_dataset, create_data_loaders
+    from utils.data_augmentation import get_train_transforms
+    import torch.optim as optim
+    from tqdm import tqdm
+    
+    # 加载处理后的数据
+    train_data, train_labels, _ = prepare_dataset(
+        args.data_path, 
+        use_cache=args.use_cache
+    )
+    print(f"训练数据形状: {train_data.shape}, 标签形状: {train_labels.shape}")
+    print("="*50)
+    from sklearn.model_selection import train_test_split
+
+    # 使用分层抽样，保证每个类别在训练集和验证集中的比例一致
+    train_data, val_data, train_labels, val_labels = train_test_split(
+        train_data, 
+        train_labels, 
+        test_size=0.2,                # 验证集占20%
+        random_state=42,              # 设置随机种子确保结果可复现
+        stratify=train_labels         # 关键参数：确保按类别标签分层抽样
+    )
+    
+    # 创建数据加载器
+    train_transforms = get_train_transforms()
+    train_loader = create_data_loaders(train_data, train_labels, args.batch_size, train_transforms)
+    val_loader = create_data_loaders(val_data, val_labels, args.batch_size)
+    
+    # 初始化预训练模型
+    num_channels = train_data.shape[1]  # 获取通道数
+    model = MaskedAutoencoderViT(
+        img_size=config.IMG_SIZE,
+        patch_size=config.PATCH_SIZE,
+        in_channels=num_channels,
+        embed_dim=config.VIT_HIDDEN_SIZE,
+        depth=config.VIT_NUM_LAYERS,
+        n_heads=config.VIT_NUM_HEADS,
+        decoder_embed_dim=config.VIT_HIDDEN_SIZE // 2,
+        decoder_depth=6,
+        decoder_n_heads=config.VIT_NUM_HEADS // 2,
+        mlp_ratio=config.VIT_MLP_SIZE / config.VIT_HIDDEN_SIZE,
+        mask_ratio=config.MASK_RATIO
+    )
+    
+    # 多GPU训练
+    if config.NUM_GPUS > 1:
+        model = torch.nn.DataParallel(model)
+    
+    model = model.to(config.DEVICE)
+    
+    # 定义优化器
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config.PRETRAIN_LR,
+        weight_decay=config.WEIGHT_DECAY
+    )
+    
+    # 学习率调度器
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=args.pretrain_epochs, 
+        eta_min=config.PRETRAIN_LR / 100
+    )
+    
+    # 训练循环
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+
+    # 定义重建损失计算函数
+    def compute_reconstruction_loss(inputs, pred, mask, model):
+        # 获取patch大小
+        if hasattr(model, 'module'):  # DataParallel包装
+            patch_size = model.module.patch_embed.patch_size
+        else:
+            patch_size = model.patch_embed.patch_size
+        
+        # 将输入重塑为patch形式
+        B, C, H, W = inputs.shape
+        p = patch_size
+        
+        p_h = p[0] if isinstance(p, tuple) else p
+        p_w = p[1] if isinstance(p, tuple) else p
+        h, w = H // p_h, W // p_w
+        target = inputs.reshape(B, C, h, p_h, w, p_w).permute(0, 2, 4, 1, 3, 5).reshape(B, h*w, C*p_h*p_w)
+        
+        # 计算掩码patch的损失
+        loss = torch.nn.functional.mse_loss(pred, target, reduction='none')  # [B, N, C*P*P]
+        loss = loss.mean(dim=-1)  # [B, N]
+        
+        # 只考虑被掩码的patch
+        mask = mask.to(inputs.device)
+        loss = (loss * mask).sum() / mask.sum()
+        
+        return loss
+    
+    for epoch in range(args.pretrain_epochs):
+        print(f"\nEpoch {epoch+1}/{args.pretrain_epochs}")
+        
+        # 训练
+        model.train()
+        total_train_loss = 0
+        
+        for i, (inputs, _) in enumerate(train_loader):
+            inputs = inputs.to(config.DEVICE, non_blocking=True)  # 添加 non_blocking=True
+            
+            optimizer.zero_grad()
+            # 前向传播
+            pred, mask, _ = model(inputs)
+            loss = compute_reconstruction_loss(inputs, pred, mask, model)
+            
+            # 反向传播
+            loss.backward()
+            optimizer.step()
+        
+        train_loss = total_train_loss / len(train_loader)
+        train_losses.append(train_loss)
+        
+        # 验证
+        model.eval()
+        total_val_loss = 0
+                
+        with torch.no_grad():
+            for inputs, _ in val_loader:
+                inputs = inputs.to(config.DEVICE, non_blocking=True)
+                # 前向传播
+                pred, mask, _ = model(inputs)
+                
+                # 计算重建损失
+                loss = compute_reconstruction_loss(inputs, pred, mask, model)
+                
+                # 减少CPU-GPU同步，直接累积tensor
+                total_val_loss += loss
+            
+            # 在循环结束后只调用一次item()
+            val_loss = (total_val_loss / len(val_loader)).item()
+
+        # 记录验证损失
+        val_losses.append(val_loss)
+
+        # 更新学习率
+        scheduler.step()
+
+        # 简化输出
+        print(f"训练损失: {train_loss:.4f}, 验证损失: {val_loss:.4f}")
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            # 保存模型权重（只保存编码器部分）
+            if config.NUM_GPUS > 1:
+                encoder_state_dict = model.module.blocks.state_dict()
+                cls_token = model.module.cls_token.data
+                pos_embed = model.module.pos_embed.data
+            else:
+                encoder_state_dict = model.blocks.state_dict()
+                cls_token = model.cls_token.data
+                pos_embed = model.pos_embed.data
+            
+            # 保存编码器权重
+            torch.save({
+                'blocks': encoder_state_dict,
+                'cls_token': cls_token,
+                'pos_embed': pos_embed,
+                'img_size': config.IMG_SIZE,
+                'patch_size': config.PATCH_SIZE,
+                'in_channels': num_channels,
+                'embed_dim': config.VIT_HIDDEN_SIZE,
+                'depth': config.VIT_NUM_LAYERS,
+                'n_heads': config.VIT_NUM_HEADS,
+                'mlp_ratio': config.VIT_MLP_SIZE / config.VIT_HIDDEN_SIZE
+            }, args.pretrained_weights)
+            print(f"保存最佳模型，验证损失: {best_val_loss:.4f}")
+            
+    # 保存预训练结果到缓存
+    from utils.visualization import save_learning_curves
+    save_learning_curves(train_losses, val_losses, [], [], os.path.join(args.output_dir, 'pretrain_curves'))
+    
+    print(f"预训练完成! 最佳验证损失: {best_val_loss:.4f}")
+    print("="*50)
+
+def finetune(args):
+    """模型微调"""
+    print("\n" + "="*50)
+    print("开始模型微调...")
+    
+    # 导入微调所需模块
+    from models.vit_model import VisionTransformer
+    from utils.data_processing import prepare_dataset, create_kfold_loaders
+    from utils.data_augmentation import get_train_transforms, MixUp
+    from utils.metrics import evaluate_model
+    import torch.optim as optim
+    import torch.nn as nn
+    from tqdm import tqdm
+    from utils.visualization import plot_confusion_matrix, plot_classification_metrics, save_learning_curves
+    
+    # 加载处理后的数据
+    data, labels, _ = prepare_dataset(
+        args.data_path, 
+        use_cache=args.use_cache
+    )
+    print(f"训练数据形状: {data.shape}, 标签形状: {labels.shape}")
+    print("="*50)
+    # 检查预训练权重
+    if not os.path.exists(args.pretrained_weights):
+        print(f"警告: 预训练权重未找到: {args.pretrained_weights}. 将从头开始训练。")
+        pretrained_weights = None
+    else:
+        pretrained_weights = args.pretrained_weights
+    
+    # 加载预训练权重的函数
+    def load_pretrained_weights(model, weights_path):
+        """加载预训练权重到模型"""
+        if weights_path is None:
+            return model
+        
+        pretrained = torch.load(weights_path)
+        
+        # 加载Transformer块权重
+        model_blocks = model.blocks.state_dict()
+        pretrained_blocks = pretrained['blocks']
+        
+        # 检查键是否匹配
+        model_keys = set(model_blocks.keys())
+        pretrained_keys = set(pretrained_blocks.keys())
+        
+        # 只加载匹配的键
+        common_keys = model_keys.intersection(pretrained_keys)
+        
+        # 创建新的状态字典
+        new_state_dict = {}
+        for key in common_keys:
+            new_state_dict[key] = pretrained_blocks[key]
+        
+        # 加载Transformer块权重
+        model.blocks.load_state_dict(new_state_dict, strict=False)
+        
+        # 加载类别标记和位置嵌入
+        model.cls_token.data = pretrained['cls_token']
+        model.pos_embed.data = pretrained['pos_embed']
+        
+        print(f"加载预训练权重: {weights_path}")
+        return model
+    
+    # 创建模型函数
+    def create_model(pretrained_weights=None):
+        """创建模型并加载预训练权重"""
+        num_channels = data.shape[1]  # 获取通道数
+        
+        # 初始化模型
+        model = VisionTransformer(
+            img_size=config.IMG_SIZE,
+            patch_size=config.PATCH_SIZE,
+            in_channels=num_channels,
+            n_classes=config.NUM_CLASSES,
+            embed_dim=config.VIT_HIDDEN_SIZE,
+            depth=config.VIT_NUM_LAYERS,
+            n_heads=config.VIT_NUM_HEADS,
+            mlp_ratio=config.VIT_MLP_SIZE / config.VIT_HIDDEN_SIZE,
+            drop_rate=config.DROPOUT_RATE
         )
-        resized_list.append(resized.numpy())
-    return resized_list
+        
+        # 加载预训练权重
+        if pretrained_weights:
+            model = load_pretrained_weights(model, pretrained_weights)
+        
+        return model
+    
+    # K折交叉验证
+    fold_results = []
+    
+    for fold in range(args.k_folds):
+        print(f"\nFold {fold+1}/{args.k_folds}")
+        
+        # 创建K折数据加载器
+        train_transforms = get_train_transforms()
+        train_loader, val_loader = create_kfold_loaders(
+            data, labels, args.k_folds, fold, args.batch_size, train_transforms
+        )
+        
+        # 创建模型
+        model = create_model(pretrained_weights)
+        
+        # 多GPU训练
+        if config.NUM_GPUS > 1:
+            model = nn.DataParallel(model)
+        
+        model = model.to(config.DEVICE)
+        
+        # 定义损失函数
+        criterion = nn.CrossEntropyLoss()
+        
+        # 差异化学习率
+        # 骨干网络使用较小的学习率
+        backbone_params = []
+        head_params = []
+        
+        for name, param in model.named_parameters():
+            if 'head' in name:
+                head_params.append(param)
+            else:
+                backbone_params.append(param)
+        
+        # 定义优化器
+        optimizer = optim.AdamW([
+            {'params': backbone_params, 'lr': config.FINETUNE_LR_BACKBONE},
+            {'params': head_params, 'lr': config.FINETUNE_LR_HEAD}
+        ], weight_decay=config.WEIGHT_DECAY)
+        
+        # 学习率调度器
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=args.finetune_epochs, 
+            eta_min=config.FINETUNE_LR_BACKBONE / 10
+        )
+        
+        # 训练循环
+        train_losses = []
+        train_accs = []
+        val_losses = []
+        val_accs = []
+
+        # 训练函数
+        def train_one_epoch(model, train_loader, criterion, optimizer, device, use_mixup=True):
+            """训练一个epoch"""
+            model.train()
+            total_loss = 0
+            correct = 0
+            total = 0
+            
+            mixup_fn = MixUp(alpha=0.2) if use_mixup else None
+            
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                
+                # 应用MixUp
+                if use_mixup:
+                    inputs, labels_a, labels_b, lam = mixup_fn(inputs, labels)
+                    
+                    # 清除梯度
+                    optimizer.zero_grad()
+                    
+                    # 前向传播
+                    outputs = model(inputs)
+                    
+                    # 计算混合损失
+                    loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+                else:
+                    # 清除梯度
+                    optimizer.zero_grad()
+                    
+                    # 前向传播
+                    outputs = model(inputs)
+                    
+                    # 计算损失
+                    loss = criterion(outputs, labels)
+                
+                # 反向传播和优化
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                
+                # 计算准确率
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                
+                if use_mixup:
+                    # 混合标签的准确率计算
+                    correct += (lam * predicted.eq(labels_a).sum().float() 
+                            + (1 - lam) * predicted.eq(labels_b).sum().float())
+                else:
+                    correct += predicted.eq(labels).sum().item()
+            
+            train_loss = total_loss / len(train_loader)
+            train_acc = correct / total
+            
+            return train_loss, train_acc
+
+        # 验证函数
+        def validate(model, val_loader, criterion, device):
+            """验证模型"""
+            model.eval()
+            total_loss = 0
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    
+                    # 前向传播
+                    outputs = model(inputs)
+                    
+                    # 计算损失
+                    loss = criterion(outputs, labels)
+                    
+                    total_loss += loss.item()
+                    
+                    # 计算准确率
+                    _, predicted = outputs.max(1)
+                    total += labels.size(0)
+                    correct += predicted.eq(labels).sum().item()
+            
+            val_loss = total_loss / len(val_loader)
+            val_acc = correct / total
+            
+            return val_loss, val_acc
+
+        # 早停参数
+        patience = 15  # 验证指标不再提升的轮数
+        early_stop_counter = 0
+        early_stop_threshold = 0.0005  # 认为有提升的最小阈值
+        best_val_acc = 0
+        best_val_loss = float('inf')
+
+        for epoch in range(args.finetune_epochs):
+            print(f"\nEpoch {epoch+1}/{args.finetune_epochs}")
+            
+            # 训练
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, config.DEVICE
+            )
+            train_losses.append(train_loss)
+            train_accs.append(train_acc.detach().cpu().item() if torch.is_tensor(train_acc) else float(train_acc))
+            
+            # 验证
+            val_loss, val_acc = validate(
+                model, val_loader, criterion, config.DEVICE
+            )
+            val_losses.append(val_loss)
+            val_accs.append(val_acc.detach().cpu().item() if torch.is_tensor(val_acc) else float(val_acc))
+            
+            # 更新学习率
+            scheduler.step()
+            
+            print(f"训练损失: {train_loss:.4f}, 训练准确率: {train_acc:.4f}")
+            print(f"验证损失: {val_loss:.4f}, 验证准确率: {val_acc:.4f}")
+            
+            # 首先检查验证准确率是否已达到高水平
+            if val_acc >= 0.99:
+                # 当准确率已很高时，转为监控损失值
+                if val_loss < best_val_loss - early_stop_threshold:
+                    best_val_loss = val_loss
+                    best_val_acc = max(best_val_acc, val_acc)  # 同时更新最佳准确率
+                    early_stop_counter = 0
+                    
+                    # 保存最佳模型
+                    model_path = os.path.join(args.output_dir, f"best_model_fold{fold+1}.pth")
+                    if config.NUM_GPUS > 1:
+                        torch.save(model.module.state_dict(), model_path)
+                    else:
+                        torch.save(model.state_dict(), model_path)
+                    print(f"保存最佳模型，验证准确率: {val_acc:.4f}，验证损失: {val_loss:.4f}")
+                else:
+                    early_stop_counter += 1
+                    print(f"验证损失未改善，早停计数: {early_stop_counter}/{patience}")
+            else:
+                # 准确率尚未达到高水平时，仍以准确率为准
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    early_stop_counter = 0
+                    
+                    # 保存最佳模型
+                    model_path = os.path.join(args.output_dir, f"best_model_fold{fold+1}.pth")
+                    if config.NUM_GPUS > 1:
+                        torch.save(model.module.state_dict(), model_path)
+                    else:
+                        torch.save(model.state_dict(), model_path)
+                    print(f"保存最佳模型，验证准确率: {best_val_acc:.4f}")
+                else:
+                    early_stop_counter += 1
+                    print(f"验证准确率未提升，早停计数: {early_stop_counter}/{patience}")
+            
+            # 早停判断
+            if early_stop_counter >= patience:
+                print(f"早停触发! {patience}个epoch未见显著改善")
+                break
+        # 保存学习曲线
+        save_dir = os.path.join(args.output_dir, f"fold{fold+1}_curves")
+        save_learning_curves(train_losses, val_losses, train_accs, val_accs, save_dir)
+        
+        # 最终评估
+        # 加载最佳模型
+        model_path = os.path.join(args.output_dir, f"best_model_fold{fold+1}.pth")
+        if config.NUM_GPUS > 1:
+            model.module.load_state_dict(torch.load(model_path))
+        else:
+            model.load_state_dict(torch.load(model_path))
+        
+        # 评估
+        metrics = evaluate_model(model, val_loader, config.DEVICE)
+        
+        print(f"\nFold {fold+1} 结果:")
+        print(f"准确率: {metrics['accuracy']:.4f}")
+        print(f"宏平均精确率: {metrics['precision_macro']:.4f}")
+        print(f"宏平均召回率: {metrics['recall_macro']:.4f}")
+        print(f"宏平均F1: {metrics['f1_macro']:.4f}")
+        
+        # 绘制混淆矩阵
+        plt_path = os.path.join(args.output_dir, f"fold{fold+1}_confusion_matrix.png")
+        plot_confusion_matrix(
+            metrics['labels'],
+            metrics['predictions'],
+            figsize=(12, 10)
+        )
+        plt.savefig(plt_path)
+        plt.close()
+        
+        # 保存结果
+        fold_results.append({
+            'fold': fold + 1,
+            'accuracy': metrics['accuracy'],
+            'precision_macro': metrics['precision_macro'],
+            'recall_macro': metrics['recall_macro'],
+            'f1_macro': metrics['f1_macro'],
+            'best_val_acc': best_val_acc
+        })
+    
+    # 打印所有折的平均结果
+    print("\n所有折的平均结果:")
+    avg_accuracy = np.mean([r['accuracy'] for r in fold_results])
+    avg_precision = np.mean([r['precision_macro'] for r in fold_results])
+    avg_recall = np.mean([r['recall_macro'] for r in fold_results])
+    avg_f1 = np.mean([r['f1_macro'] for r in fold_results])
+    
+    print(f"准确率: {avg_accuracy:.4f}")
+    print(f"宏平均精确率: {avg_precision:.4f}")
+    print(f"宏平均召回率: {avg_recall:.4f}")
+    print(f"宏平均F1: {avg_f1:.4f}")
+    
+    # 保存最佳模型（以最高验证准确率为标准）
+    best_fold = max(fold_results, key=lambda x: x['accuracy'])['fold']
+    best_model_path = os.path.join(args.output_dir, f"best_model_fold{best_fold}.pth")
+    
+    # 复制最佳模型
+    import shutil
+    shutil.copy(best_model_path, args.final_model_path)
+    print(f"\n从fold {best_fold}中选择最佳模型作为最终模型。")
+    
+    print("="*50)
+
+def evaluate(args):
+    """模型评估"""
+    print("\n" + "="*50)
+    print("开始模型评估...")
+    
+    # 导入评估所需模块
+    from models.vit_model import VisionTransformer
+    from utils.data_processing import prepare_test_dataset, create_data_loaders
+    from utils.metrics import evaluate_model, extract_features
+    from utils.visualization import plot_confusion_matrix, plot_classification_metrics, plot_feature_space, visualize_attention
+    
+    # 检查模型路径
+    if not os.path.exists(args.final_model_path):
+        raise FileNotFoundError(f"模型文件未找到: {args.final_model_path}")
+    
+    # 加载测试数据
+    test_data, test_labels, _ = prepare_test_dataset(
+        args.data_path, 
+        use_cache=args.use_cache
+    )
+    
+    # 创建测试数据加载器
+    test_loader = create_data_loaders(test_data, test_labels, args.batch_size, shuffle=False)
+    
+    # 创建模型
+    num_channels = test_data.shape[1]  # 获取通道数
+    model = VisionTransformer(
+        img_size=config.IMG_SIZE,
+        patch_size=config.PATCH_SIZE,
+        in_channels=num_channels,
+        n_classes=config.NUM_CLASSES,
+        embed_dim=config.VIT_HIDDEN_SIZE,
+        depth=config.VIT_NUM_LAYERS,
+        n_heads=config.VIT_NUM_HEADS,
+        mlp_ratio=config.VIT_MLP_SIZE / config.VIT_HIDDEN_SIZE
+    )
+    
+    # 加载预训练权重
+    model.load_state_dict(torch.load(args.final_model_path))
+    model = model.to(config.DEVICE)
+    
+    # 评估
+    print("评估模型...")
+    metrics = evaluate_model(model, test_loader, config.DEVICE)
+    
+    # 评估目录
+    eval_dir = os.path.join(args.output_dir, "evaluation")
+    os.makedirs(eval_dir, exist_ok=True)
+    
+    # 保存结果
+    results_path = os.path.join(eval_dir, "evaluation_results.txt")
+    with open(results_path, "w") as f:
+        f.write("评估结果:\n")
+        f.write(f"准确率: {metrics['accuracy']:.4f}\n")
+        f.write(f"宏平均精确率: {metrics['precision_macro']:.4f}\n")
+        f.write(f"宏平均召回率: {metrics['recall_macro']:.4f}\n")
+        f.write(f"宏平均F1: {metrics['f1_macro']:.4f}\n")
+        f.write(f"加权精确率: {metrics['precision_weighted']:.4f}\n")
+        f.write(f"加权召回率: {metrics['recall_weighted']:.4f}\n")
+        f.write(f"加权F1: {metrics['f1_weighted']:.4f}\n")
+        f.write(config.log_output)
+    print(f"\n评估结果:")
+    print(f"准确率: {metrics['accuracy']:.4f}")
+    print(f"宏平均精确率: {metrics['precision_macro']:.4f}")
+    print(f"宏平均召回率: {metrics['recall_macro']:.4f}")
+    print(f"宏平均F1: {metrics['f1_macro']:.4f}")
+    
+    # 绘制混淆矩阵
+    print("生成混淆矩阵...")
+    cm_path = os.path.join(eval_dir, "confusion_matrix.png")
+    plot_confusion_matrix(
+        metrics['labels'],
+        metrics['predictions'],
+        figsize=(12, 10)
+    )
+    plt.savefig(cm_path)
+    plt.close()
+    
+    # 绘制分类指标
+    print("生成分类指标图...")
+    metrics_path = os.path.join(eval_dir, "classification_metrics.png")
+    plot_classification_metrics(
+        metrics['labels'],
+        metrics['predictions'],
+        figsize=(15, 8)
+    )
+    plt.savefig(metrics_path)
+    plt.close()
+    
+    # 提取特征并可视化特征空间
+    print("提取特征并可视化...")
+    features, feature_labels = extract_features(model, test_loader, config.DEVICE)
+    
+    # 绘制特征空间
+    features_path = os.path.join(eval_dir, "feature_space.png")
+    plot_feature_space(features, feature_labels, figsize=(12, 10))
+    plt.savefig(features_path)
+    plt.close()
+     # 可视化注意力图
+    if args.mode == "evaluate":
+        print("可视化注意力图...")
+        visualize_samples = min(3, len(test_data))
+        for i in range(visualize_samples):
+            sample = torch.tensor(test_data[i], dtype=torch.float32)
+            for head_idx in range(min(3, config.VIT_NUM_HEADS)):
+                attn_path = os.path.join(eval_dir, f"attention_sample{i+1}_head{head_idx+1}.png")
+                visualize_attention(
+                    model,
+                    sample,
+                    head_idx=head_idx,
+                    layer_idx=-1,
+                    save_path=attn_path
+                )
+    
+    print(f"评估完成，结果保存至: {eval_dir}")
+    print("="*50)
 
 def main():
-    # 设置随机种子
-    set_seed(42)
+    args = parse_args()
     
-    # 检查CUDA是否可用
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+    # 确保输出目录存在
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # 指定timm缓存目录
-    timm_cache_dir = os.path.expanduser("~/timm_cache")
-    os.makedirs(timm_cache_dir, exist_ok=True)
-    os.environ['TORCH_HOME'] = timm_cache_dir
-    print(f"timm模型将缓存到: {timm_cache_dir}")
+    # 显示基本信息
+    print("\n" + "="*50)
+    print("基于Vision Transformer的轨道交通传动系统故障诊断")
+    print("="*50)
+    print(f"运行模式: {args.mode}")
+    print(f"设备: {config.DEVICE} ({'GPU' if torch.cuda.is_available() else 'CPU'})")
+    print(f"GPU数量: {config.NUM_GPUS}")
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+    print(f"输出目录: {args.output_dir}")
+    print(f"缓存目录: {config.CACHE_DIR}")
+    print(config.log_output)
+    print("="*50)
     
-    # 创建模型管理器（为了兼容性）
-    hf_cache_dir = os.path.expanduser("~/huggingface_models")
-    hf_manager = HuggingFaceModelManager(cache_dir=hf_cache_dir)
-
-    ############################################################################
-    ######################### 数据加载逻辑 #####################################
-    ############################################################################
-    # 初始化处理器和必要变量
-    processor = DataProcessor(scaler_type='robust')
-    components = None
-    num_classes = None
+    # # # 根据模式运行相应的功能
+    # if args.mode in ["preprocess", "all"]:
+    #     preprocess(args)
     
-    # 1. 检查是否存在增强数据缓存
-    print("\n开始检查各级缓存数据...")
-    augmented_cache_exists = cache_exists("augmented_data")
-    augmented_cache_exists = False
+    # if args.mode in ["pretrain", "all"]:
+    #     pretrain(args)
     
-    if augmented_cache_exists:
-        print("【1/4】发现增强数据缓存，直接加载...")
-        
-        # 加载增强数据缓存
-        augmented_cache = load_from_cache("augmented_data")
-        
-        # 提取所有必要数据
-        train_components = augmented_cache['train_components']
-        val_components = augmented_cache['val_components']
-        test_components = augmented_cache['test_components']
-        train_labels = augmented_cache['train_labels']
-        val_labels = augmented_cache['val_labels']
-        test_labels = augmented_cache['test_labels']
-        train_conditions = augmented_cache['train_conditions']
-        val_conditions = augmented_cache['val_conditions']
-        test_conditions = augmented_cache['test_conditions']
-        components = augmented_cache['components']
-        num_classes = augmented_cache.get('num_classes', len(np.unique(train_labels)))
-        
-        print(f"增强数据加载完成: {len(train_labels)}训练样本, {len(val_labels)}验证样本, {len(test_labels)}测试样本")
-        print(f"数据形状: {train_components[0].shape}")
-        
-        # 跳过所有其他数据处理步骤
-        skip_all_processing = True
-        
-    else:
-        # 2. 检查是否存在STFT数据缓存
-        stft_cache_exists = cache_exists("stft_data")
-        stft_cache_exists = False
-        
-        if stft_cache_exists:
-            print("【2/4】未找到增强数据缓存，但发现STFT数据缓存，将加载STFT数据...")
-            
-            # 加载STFT数据缓存
-            stft_data = load_stft_data()
-            
-            # 提取所有必要数据
-            train_components = stft_data['train_components']
-            val_components = stft_data['val_components']
-            test_components = stft_data['test_components']
-            train_conditions = stft_data['train_conditions']
-            val_conditions = stft_data['val_conditions']
-            test_conditions = stft_data['test_conditions']
-            train_labels = stft_data['train_labels']
-            val_labels = stft_data['val_labels']
-            test_labels = stft_data['test_labels']
-            components = stft_data['components']
-            
-            # 尝试获取num_classes
-            train_cache_exists = cache_exists("training_data")
-            if train_cache_exists:
-                train_data = load_from_cache("training_data")
-                fault_types = train_data['fault_types']
-                num_classes = len(fault_types)
-            else:
-                num_classes = len(np.unique(train_labels))
-            
-            print(f"STFT数据加载完成: {len(train_labels)}训练样本, {len(val_labels)}验证样本, {len(test_labels)}测试样本")
-            
-            # 需要调整大小和进行数据增强
-            skip_raw_loading = True
-            skip_split_before_stft = True  # 已经是STFT后的数据
-            skip_stft_processing = True
-            
-        else:
-            # 3. 检查是否存在原始数据缓存
-            train_cache_exists = cache_exists("training_data")
-            test_cache_exists = cache_exists("testing_data")
-            
-            if train_cache_exists and test_cache_exists:
-                print("【3/4】未找到STFT数据缓存，但发现原始数据缓存，将加载原始数据...")
-                
-                # 加载训练数据缓存
-                train_data = load_from_cache("training_data")
-                component_arrays_train = train_data['component_arrays']
-                train_labels_full = train_data['labels'] # 重命名保持一致
-                conditions_train_full = train_data['conditions']
-                fault_types = train_data['fault_types']
-                num_classes = len(fault_types)
-                
-                # 加载测试数据缓存
-                test_data = load_from_cache("testing_data")
-                component_arrays_test = test_data['component_arrays']
-                test_labels = test_data['labels'] # 重命名保持一致
-                conditions_test = test_data['conditions']
-                
-                # 获取组件列表
-                components = list(component_arrays_train.keys())
-                
-                print(f"原始数据加载完成: {len(train_labels_full)}训练样本, {len(test_labels)}测试样本")
-                
-                # 需要划分训练集和验证集，再进行工况增强、STFT等处理
-                skip_raw_loading = True
-                skip_split_before_stft = False
-                skip_stft_processing = False
-                
-            else:
-                # 4. 直接从文件读取原始数据
-                print("【4/4】未找到任何缓存，将从文件读取原始数据...")
-                
-                # 初始化数据加载器
-                loader = DataLoader("Datasets")
-                
-                # 获取故障类型
-                fault_types = loader.get_fault_types()
-                print(f"发现故障类型: {fault_types}")
-                num_classes = len(fault_types)
-                
-                # 加载训练数据
-                print("正在加载训练数据...")
-                component_arrays_train, train_labels_full, conditions_train_full = loader.get_processed_dataset(dataset="Training")
-                
-                # 加载测试数据
-                print("正在加载测试数据...")
-                component_arrays_test, test_labels, conditions_test = loader.get_processed_dataset(dataset="Test")
-                
-                # 获取组件列表
-                components = list(component_arrays_train.keys())
-                
-                # 保存原始数据缓存
-                train_cache = {
-                    'component_arrays': component_arrays_train,
-                    'labels': train_labels_full,
-                    'conditions': conditions_train_full,
-                    'fault_types': fault_types
-                }
-                save_to_cache(train_cache, "training_data")
-                
-                test_cache = {
-                    'component_arrays': component_arrays_test,
-                    'labels': test_labels,
-                    'conditions': conditions_test
-                }
-                save_to_cache(test_cache, "testing_data")
-                
-                print(f"原始数据加载完成并已缓存: {len(train_labels_full)}训练样本, {len(test_labels)}测试样本")
-                
-                # 需要划分训练集和验证集，再进行工况增强、STFT等处理
-                skip_raw_loading = True
-                skip_split_before_stft = False
-                skip_stft_processing = False
-                
-        skip_all_processing = False
-
-    ############################################################################
-    ######################### 训练集和验证集划分 ###############################
-    ############################################################################
-    if not skip_all_processing:
-        if not skip_split_before_stft:
-            print("\n在任何增强之前先划分训练集和验证集...")
-            
-            # 从训练集中划分出验证集
-            train_indices, val_indices = train_test_split(
-                np.arange(len(train_labels_full)), 
-                test_size=0.4,  # 训练集的40%作为验证集
-                random_state=42,
-                stratify=train_labels_full  # 保证各类别比例一致
-            )
-            
-            print(f"原始数据划分: 训练集={len(train_indices)}样本, 验证集={len(val_indices)}样本, 测试集={len(test_labels)}样本")
-            
-            # 分割标签
-            train_labels = train_labels_full[train_indices]
-            val_labels = train_labels_full[val_indices]
-            
-            # 分割工况数据
-            train_conditions_raw = conditions_train_full[train_indices]
-            val_conditions_raw = conditions_train_full[val_indices]
-            
-            # 分割组件数据
-            train_components_dict = {}
-            val_components_dict = {}
-            
-            for component in components:
-                train_components_dict[component] = component_arrays_train[component][train_indices]
-                val_components_dict[component] = component_arrays_train[component][val_indices]
-            
-            print(f"训练集标签分布: {np.unique(train_labels, return_counts=True)}")
-            print(f"验证集标签分布: {np.unique(val_labels, return_counts=True)}")
-                
-        ############################################################################
-        ######################### 工况平衡增强 #####################################
-        ############################################################################
-        if not skip_stft_processing:
-            print("\n仅对训练集进行工况平衡增强,模拟未知工况...")
-            
-            # 确保工况条件数组格式正确
-            print(f"原始训练集工况条件数组形状: {train_conditions_raw.shape}")
-            print(f"原始训练集工况负载分布: {np.unique(train_conditions_raw[:, 1], return_counts=True)}")
-            print(f"原始训练集样本数: {len(train_labels)}")
-            
-            # 仅对训练集应用负载模拟增强
-            augmented_components, augmented_conditions, augmented_labels = augment_with_load_simulation(
-                train_components_dict,  # 原始时域数据字典
-                train_conditions_raw,   # 原始工况
-                train_labels,           # 原始标签
-                num_augmented=2         # 每个样本生成2个新样本( 1个0kN,1个1kN)
-            )
-            
-            # 更新训练集数据
-            train_components_dict = augmented_components
-            train_conditions_raw = augmented_conditions
-            train_labels = augmented_labels
-            
-            print(f"工况增强后训练集样本数: {len(train_labels)}")
-            print(f"工况增强后训练集负载分布: {np.unique(train_conditions_raw[:, 1], return_counts=True)}")
-            
-            ############################################################################
-            ######################### STFT转换 #########################################
-            ############################################################################
-            print("\n对各部件数据进行STFT变换...")
-
-            # 设置STFT参数
-            stft_params = {
-                'fs': 1000,         # 采样率Hz
-                'nperseg': 1024,    # 窗口长度
-                'noverlap': 768,    # 重叠点数 (75%重叠)
-                'window': 'hann',   # 窗函数
-                'detrend': False,   # 不去趋势
-            }
-
-            # 检测训练集和测试集的时间长度差异
-            train_length = next(iter(train_components_dict.values())).shape[1]
-            val_length = next(iter(val_components_dict.values())).shape[1]
-            test_length = next(iter(component_arrays_test.values())).shape[1]
-            print(f"检测到样本长度: 训练集={train_length}, 验证集={val_length}, 测试集={test_length}")
-
-            # 初始化组件列表和STFT结果列表
-            train_components = []
-            val_components = []
-            test_components = []
-
-            # 提前编码所有工况，避免重复编码
-            print("编码工况数据")
-            train_conditions = processor.encode_conditions_batch(train_conditions_raw)
-            val_conditions = processor.encode_conditions_batch(val_conditions_raw)
-            test_conditions = processor.encode_conditions_batch(conditions_test)
-            print("工况编码完成")
-
-            # 使用批处理来提高效率
-            batch_size = 16  # 可调整的批大小
-
-            # 处理训练集各部件数据
-            for component_idx, component in enumerate(components):
-                print(f"处理 {component} 训练数据... ({component_idx+1}/{len(components)})")
-                
-                # 对该部件的所有样本应用STFT
-                component_data = train_components_dict[component]
-                total_samples = component_data.shape[0]
-                all_stft = []
-                
-                # 使用批处理处理样本
-                for batch_start in range(0, total_samples, batch_size):
-                    batch_end = min(batch_start + batch_size, total_samples)
-                    batch_size_actual = batch_end - batch_start
-                    
-                    # 打印处理进度
-                    if batch_start % (batch_size * 10) == 0 or batch_start + batch_size >= total_samples:
-                        print(f"  - 处理样本 {batch_start}-{batch_end-1}/{total_samples}")
-                    
-                    # 准备批数据
-                    batch_samples = component_data[batch_start:batch_end]
-                    batch_conditions = train_conditions_raw[batch_start:batch_end]
-                    batch_labels = train_labels[batch_start:batch_end] if train_labels is not None else None
-                    
-                    # 批量应用STFT
-                    batch_stft_result, _, _ = processor.process_dataset(
-                        batch_samples, 
-                        batch_conditions, 
-                        batch_labels,
-                        component_name=component,
-                        apply_stft=True, 
-                        stft_params=stft_params
-                    )
-                    
-                    # 将批次结果添加到列表
-                    for i in range(batch_size_actual):
-                        all_stft.append(batch_stft_result[i])
-                
-                # 堆叠所有样本的STFT结果
-                train_components.append(np.stack(all_stft))
-                print(f"  - 完成 {component} 训练数据，形状: {train_components[-1].shape}")
-                
-            # 处理验证集各部件数据
-            for component_idx, component in enumerate(components):
-                print(f"处理 {component} 验证数据... ({component_idx+1}/{len(components)})")
-                
-                # 对该部件的所有样本应用STFT
-                component_data = val_components_dict[component]
-                total_samples = component_data.shape[0]
-                all_stft = []
-                
-                # 使用批处理处理样本
-                for batch_start in range(0, total_samples, batch_size):
-                    batch_end = min(batch_start + batch_size, total_samples)
-                    batch_size_actual = batch_end - batch_start
-                    
-                    # 打印处理进度
-                    if batch_start % (batch_size * 10) == 0 or batch_start + batch_size >= total_samples:
-                        print(f"  - 处理样本 {batch_start}-{batch_end-1}/{total_samples}")
-                    
-                    # 准备批数据
-                    batch_samples = component_data[batch_start:batch_end]
-                    batch_conditions = val_conditions_raw[batch_start:batch_end]
-                    batch_labels = val_labels[batch_start:batch_end] if val_labels is not None else None
-                    
-                    # 批量应用STFT
-                    batch_stft_result, _, _ = processor.process_dataset(
-                        batch_samples, 
-                        batch_conditions, 
-                        batch_labels,
-                        component_name=component,
-                        apply_stft=True, 
-                        stft_params=stft_params
-                    )
-                    
-                    # 将批次结果添加到列表
-                    for i in range(batch_size_actual):
-                        all_stft.append(batch_stft_result[i])
-                
-                # 堆叠所有样本的STFT结果
-                val_components.append(np.stack(all_stft))
-                print(f"  - 完成 {component} 验证数据，形状: {val_components[-1].shape}")
-
-            # 处理测试集各部件数据
-            for component_idx, component in enumerate(components):
-                print(f"处理 {component} 测试数据... ({component_idx+1}/{len(components)})")
-                
-                # 对该部件的所有样本应用STFT
-                component_data = component_arrays_test[component]
-                total_samples = component_data.shape[0]
-                all_stft = []
-                
-                # 使用批处理处理样本
-                for batch_start in range(0, total_samples, batch_size):
-                    batch_end = min(batch_start + batch_size, total_samples)
-                    batch_size_actual = batch_end - batch_start
-                    
-                    # 打印处理进度
-                    if batch_start % (batch_size * 10) == 0 or batch_start + batch_size >= total_samples:
-                        print(f"  - 处理样本 {batch_start}-{batch_end-1}/{total_samples}")
-                    
-                    # 准备批数据
-                    batch_samples = component_data[batch_start:batch_end]
-                    batch_conditions = conditions_test[batch_start:batch_end]
-                    batch_labels = test_labels[batch_start:batch_end] if test_labels is not None else None
-                    
-                    # 批量应用STFT
-                    batch_stft_result, _, _ = processor.process_dataset(
-                        batch_samples, 
-                        batch_conditions, 
-                        batch_labels,
-                        component_name=component,
-                        apply_stft=True, 
-                        stft_params=stft_params
-                    )
-                    
-                    # 将批次结果添加到列表
-                    for i in range(batch_size_actual):
-                        all_stft.append(batch_stft_result[i])
-                
-                # 堆叠所有样本的STFT结果
-                test_components.append(np.stack(all_stft))
-                print(f"  - 完成 {component} 测试数据，形状: {test_components[-1].shape}")
-
-            # STFT处理完毕后保存数据
-            print("\n保存训练集、验证集和测试集的STFT数据...")
-            save_stft_data(
-                train_components=train_components,
-                val_components=val_components,
-                test_components=test_components,
-                train_conditions=train_conditions,
-                val_conditions=val_conditions,
-                test_conditions=test_conditions,
-                train_labels=train_labels,
-                val_labels=val_labels,
-                test_labels=test_labels,
-                components=components,
-                stft_params=stft_params
-            )
-
-            # 打印STFT处理后的形状
-            print("\nSTFT处理完成，各部件STFT形状:")
-            for i, comp_data in enumerate(train_components):
-                print(f"训练集 - 部件 {components[i]}: {comp_data.shape}")
-            for i, comp_data in enumerate(val_components):
-                print(f"验证集 - 部件 {components[i]}: {comp_data.shape}")
-            for i, comp_data in enumerate(test_components):
-                print(f"测试集 - 部件 {components[i]}: {test_components[-1].shape}")
-
-        ############################################################################
-        ######################### 数据增强 #########################################
-        ############################################################################
-        print("\n仅对训练集使用SpecAugment进行数据增强...")
-        
-        # 确保标签和数据长度一致
-        data_length = train_components[0].shape[0]
-        if len(train_labels) != data_length:
-            print(f"警告: 标签长度 ({len(train_labels)}) 与数据长度 ({data_length}) 不匹配，将截断标签")
-            train_labels = train_labels[:data_length]
-            # 同时调整工况数据
-            if isinstance(train_conditions, dict) and len(train_conditions["freq_id"]) != data_length:
-                train_conditions = {
-                    "freq_id": train_conditions["freq_id"][:data_length],
-                    "load_id": train_conditions["load_id"][:data_length]
-                }
-        
-        # 记录原始数据量
-        original_len = len(train_labels)
-        
-        # 只对训练集应用SpecAugment增强
-        train_components, train_labels = augment_dataset_with_strategies(
-            train_components,   # 原始组件数据
-            train_labels,               # 原始标签
-            components,                 # 组件名称列表
-            samples_per_class=5         # 每类生成5个额外样本
-        )
-        
-        # 计算新增了多少样本
-        new_len = len(train_labels)
-        added_samples = new_len - original_len
-        print(f"训练集从 {original_len} 增加到 {new_len} 样本 (增加了 {added_samples} 样本)")
-        
-        # 同步更新工况数据 - 为新样本复制工况信息
-        # 找出每个类别对应的索引
-        unique_classes = np.unique(train_labels[:original_len])
-        
-        # 为每个生成的样本选择对应类别的一个随机工况
-        freq_id_extended = list(train_conditions["freq_id"])
-        load_id_extended = list(train_conditions["load_id"])
-        
-        # 为每个新样本分配工况
-        for i in range(original_len, new_len):
-            class_idx = train_labels[i]
-            # 找出该类别的所有原始样本索引
-            class_indices = np.where(train_labels[:original_len] == class_idx)[0]
-            # 随机选择一个索引作为工况参考
-            if len(class_indices) > 0:
-                ref_idx = np.random.choice(class_indices)
-                # 复制该索引的工况
-                freq_id_extended.append(train_conditions["freq_id"][ref_idx])
-                load_id_extended.append(train_conditions["load_id"][ref_idx])
-        
-        # 更新工况数据为扩展后的结构
-        train_conditions = {
-            "freq_id": np.array(freq_id_extended),
-            "load_id": np.array(load_id_extended),
-        }
-        
-        train_components = train_components
-        train_labels = train_labels
-        val_components = val_components
-        val_labels = val_labels
-        
-        print("工况数据已同步更新，与增强后样本数匹配")
-        
-        # ############################################################################
-        # ######################### 缓存增强后的数据 ################################
-        # ############################################################################
-        print("\n准备缓存增强后的数据...")
-        
-        # 准备缓存数据 - 注意这里保存的是已经划分好并且增强过的数据
-        augmented_cache = {
-            'train_components': train_components,
-            'val_components': val_components,
-            'test_components': test_components,
-            'train_labels': train_labels,
-            'val_labels': val_labels,
-            'y_test': test_labels,
-            'train_conditions': train_conditions,
-            'val_conditions': val_conditions,
-            'test_conditions': test_conditions,
-            'components': components,
-            'num_classes': num_classes
-        }
-        
-        # 保存缓存
-        save_to_cache(augmented_cache, "augmented_data")
-        print("增强后的数据已成功缓存，下次运行时可直接加载使用。")
-
-    ############################################################################
-    ######################### 创建多部件PyTorch数据集 ##########################
-    ############################################################################
-    # 创建MultiComponentDataset实例
-    train_dataset = MultiComponentDataset(
-        train_components, train_conditions, train_labels, 
-        transform=None, is_stft=True
-    )
+    if args.mode in ["finetune", "all"]:
+        finetune(args)
     
-    val_dataset = MultiComponentDataset(
-        val_components, val_conditions, val_labels,
-        transform=None, is_stft=True
-    )
+    if args.mode in ["evaluate", "all"]:
+        evaluate(args)
     
-    test_dataset = MultiComponentDataset(
-        test_components, test_conditions, test_labels,
-        transform=None, is_stft=True
-    )
-    
-    # 创建DataLoader
-    batch_size = 16
-    
-    train_loader = TorchDataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True,
-        num_workers=4,
-        pin_memory=torch.cuda.is_available()
-    )
-    
-    val_loader = TorchDataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=4,
-        pin_memory=torch.cuda.is_available()
-    )
-    
-    test_loader = TorchDataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=4,
-        pin_memory=torch.cuda.is_available()
-    )
-    
-    print(f"\n数据加载器创建完成: 每批{batch_size}个样本")
-    
-    # 查看一个批次的数据样式
-    for inputs, freq_ids, load_ids, labels in train_loader:
-        print("\n示例批次数据:")
-        for i, component_tensor in enumerate(inputs):
-            print(f"部件{i}张量形状: {component_tensor.shape}")
-        print(f"频率ID形状: {freq_ids.shape}")
-        print(f"负载ID形状: {load_ids.shape}")
-        print(f"标签形状: {labels.shape}")
-        break
-    
-    ############################################################################
-    ######################### 创建和训练多部件模型 #############################
-    ############################################################################
-    # 获取各部件通道数
-    component_channels = [data.shape[1] for data in train_components]
-    
-    # 使用预训练模型的选择
-    model_type = 'resnet18'
-    
-    # 创建组件分支
-    print(f"\n使用timm创建{model_type}模型分支...")
-    component_branches = []
-    for i, num_channels in enumerate(component_channels):
-        print(f"为部件{i} (通道数={num_channels})创建分支...")
-        branch = create_branch_with_hf_weights(
-            model_type, 
-            num_channels, 
-            pretrained=True,
-            hf_manager=hf_manager
-        )
-        component_branches.append(branch)
-    
-    # 创建增强模型
-    model = ImprovedMultiComponentModel(
-        branches=component_branches,
-        num_classes=num_classes,
-        working_condition=True
-    )
-    print(f"\n创建了增强的基于{model_type}的多部件模型，包含工况适应功能")
-    
-    model = model.to(device)
-    
-    # 输出模型摘要
-    print(f"\n模型架构:")
-    print(f"- {len(model.component_branches)}个部件分支网络")
-    print(f"- 每个部件的通道数: {component_channels}")
-    print(f"- 包含工况信息: 是")
-    print(f"- 使用增强工况适应器: 是")
-    
-    # 训练模型
-    print("开始训练模型...")
-    trained_model, history = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        epochs=50,
-        lr=0.001,
-        weight_decay=0.01,
-        freeze_pretrained=True,
-        unfreeze_layers=[
-             "layer3","layer4", "condition_adapters", "condition_fusion", 
-            "visual_fusion", "final_fusion"
-        ]
-    )
-    # 绘制训练历史
-    from plot_training_history import plot_training_history
-    plot_training_history(
-        history=history,
-        save_path="training_curves.png",
-        show_plot=True
-    )
-    
-    # 在测试集上评估模型
-    print("\n在测试集上评估模型...")
-    test_acc, predictions, targets = evaluate_model(
-        model=trained_model,
-        test_loader=test_loader,
-        device=device
-    )
-
-    # 按工况分析性能
-    print("\n按工况分解测试性能:")
-    test_freqs = []
-    test_loads = []
-    test_predictions = []
-    test_ground_truth = []
-
-    # 收集测试集预测和工况信息
-    with torch.no_grad():
-        for inputs, freq_ids, load_ids, targets in test_loader:
-            # 将数据移至设备
-            inputs = [x.to(device) for x in inputs]
-            freq_ids = freq_ids.to(device)
-            load_ids = load_ids.to(device)
-            targets = targets.to(device).long().squeeze()
-            
-            # 前向传播
-            outputs = trained_model(inputs, freq_ids, load_ids)
-            
-            # 获取预测
-            _, predicted = outputs.max(1)
-            
-            # 收集数据
-            test_freqs.extend(freq_ids.cpu().numpy().flatten())
-            test_loads.extend(load_ids.cpu().numpy().flatten())
-            test_predictions.extend(predicted.cpu().numpy())
-            test_ground_truth.extend(targets.cpu().numpy())
-
-    # 频率和负载ID到实际值的映射
-    freq_map = {0: "20Hz", 1: "40Hz", 2: "60Hz"}
-    load_map = {0: "0kN", 1: "1kN", 2: "-1kN"}
-
-    # 将列表转换为NumPy数组
-    test_freqs = np.array(test_freqs)
-    test_loads = np.array(test_loads)
-    test_predictions = np.array(test_predictions)
-    test_ground_truth = np.array(test_ground_truth)
-
-    # 分析每种工况下的性能
-    unique_freqs = np.unique(test_freqs)
-    unique_loads = np.unique(test_loads)
-
-    print("\n各工况测试集性能:")
-    for freq in unique_freqs:
-        for load in unique_loads:
-            # 找出该工况下的所有样本
-            indices = np.where((test_freqs == freq) & (test_loads == load))[0]
-            if len(indices) > 0:
-                # 计算该工况下的准确率
-                correct = np.sum(test_predictions[indices] == test_ground_truth[indices])
-                accuracy = 100.0 * correct / len(indices)
-                print(f"工况 {freq_map[freq]}, {load_map[load]}: 准确率 = {accuracy:.2f}% ({correct}/{len(indices)})")
-
-    # 保存模型
-    save_path = f"multi_component_{model_type}_model.pth"
-    torch.save(trained_model.state_dict(), save_path)
-    print(f"\n模型已保存至 {save_path}")
-    
-    print("\n训练和评估完成!")
+    print("\n" + "="*50)
+    print("流程完成!")
+    print("="*50)
 
 if __name__ == "__main__":
     main()
